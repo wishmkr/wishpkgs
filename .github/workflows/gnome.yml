@@ -47,6 +47,7 @@ jobs:
             libtool \
             pkg-config \
             cmake \
+            meson \
             ninja-build \
             wget \
             curl \
@@ -75,11 +76,10 @@ jobs:
             libgbm-dev \
             wayland-protocols \
             libwayland-dev \
-            libgsettings-glib-dev \
+            libglib2.0-dev \
             libpulse-dev \
             libsystemd-dev \
             libpolkit-gobject-1-dev \
-            libelogind-dev \
             libdbus-1-dev \
             libjson-glib-dev \
             libcodec2-dev \
@@ -88,7 +88,10 @@ jobs:
             llvm-dev \
             libelf-dev \
             flex \
-            bison
+            bison \
+            gobject-introspection \
+            libgirepository1.0-dev \
+            gtk-doc-tools
 
       - name: Create working directories
         run: |
@@ -113,9 +116,8 @@ jobs:
 
       - name: Build and install X.Org Server
         if: matrix.package == 'xorg-server'
-        working-directory: source
         run: |
-          cd "xorg-server-${XORG_SERVER_VERSION}"
+          cd "source/xorg-server-${XORG_SERVER_VERSION}"
           ./configure \
             --prefix=/usr \
             --sysconfdir=/etc \
@@ -163,7 +165,7 @@ jobs:
               ./configure --prefix=/usr --sysconfdir=/etc
               make -j"$(nproc)"
               make DESTDIR="$GITHUB_WORKSPACE/package-root" install
-              cd -
+              cd "$GITHUB_WORKSPACE"
             fi
           done
 
@@ -217,17 +219,15 @@ jobs:
       - name: Build and install GNOME Shell
         if: matrix.package == 'gnome-shell'
         run: |
-          cmake \
-            -S "source/gnome-shell-${GNOME_SHELL_VERSION}" \
-            -B build/gnome-shell \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr \
-            -DCMAKE_INSTALL_LIBDIR=/usr/lib \
-            -DGSETTINGS_LOCALCOMPILE=OFF \
-            -DMAN=false
-          cmake --build build/gnome-shell --parallel "$(nproc)"
-          DESTDIR="$GITHUB_WORKSPACE/package-root" cmake --install build/gnome-shell
+          meson setup \
+            --prefix=/usr \
+            --buildtype=release \
+            -Dgsettings_localcompile=false \
+            -Dman=false \
+            "source/gnome-shell-${GNOME_SHELL_VERSION}" \
+            build/gnome-shell
+          meson compile -C build/gnome-shell
+          DESTDIR="$GITHUB_WORKSPACE/package-root" meson install -C build/gnome-shell
           file "$GITHUB_WORKSPACE/package-root/usr/bin/gnome-shell" || true
 
       # ======================================================
@@ -266,7 +266,7 @@ jobs:
                 make -j"$(nproc)" || true
                 make DESTDIR="$GITHUB_WORKSPACE/package-root" install || true
               fi
-              cd -
+              cd "$GITHUB_WORKSPACE"
             fi
           done
 
@@ -435,13 +435,8 @@ jobs:
 
       - name: Commit packages to main
         run: |
-          git config \
-            user.name \
-            "WishOS Build Bot"
-
-          git config \
-            user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "WishOS Build Bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git add pkgs/
 
