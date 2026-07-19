@@ -1,0 +1,442 @@
+name: Build WishOS Graphics Base (AArch64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wishos-graphics-aarch64
+  cancel-in-progress: false
+
+env:
+  ARCH: aarch64
+  PACKAGE_RELEASE: "1"
+
+  XORG_SERVER_VERSION: "21.1.24"
+  MESA_VERSION: "24.0.8"
+  LIBINPUT_DRIVER_VERSION: "1.4.0"
+
+jobs:
+  build:
+    name: Build ${{ matrix.package }} for AArch64
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: mesa
+            version: "24.0.8"
+
+          - package: xorg-server
+            version: "21.1.24"
+
+          - package: xorg-input-libinput
+            version: "1.4.0"
+
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install common build dependencies
+        run: |
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            meson \
+            ninja-build \
+            cmake \
+            autoconf \
+            automake \
+            libtool \
+            xutils-dev \
+            wget \
+            curl \
+            file \
+            git \
+            tar \
+            gzip \
+            bzip2 \
+            xz-utils \
+            python3 \
+            python3-mako \
+            python3-packaging \
+            python3-setuptools \
+            flex \
+            bison
+
+      - name: Install graphics build dependencies
+        run: |
+          sudo apt-get install -y \
+            libdrm-dev \
+            libgbm-dev \
+            libegl-dev \
+            libgl-dev \
+            libglvnd-dev \
+            libglx-dev \
+            libwayland-dev \
+            wayland-protocols \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-dri2-0-dev \
+            libxcb-dri3-dev \
+            libxcb-glx0-dev \
+            libxcb-present-dev \
+            libxcb-randr0-dev \
+            libxcb-shm0-dev \
+            libxcb-sync-dev \
+            libxcb-xfixes0-dev \
+            libxdamage-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxfont-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxkbfile-dev \
+            libxrandr-dev \
+            libxrender-dev \
+            libxshmfence-dev \
+            libxxf86vm-dev \
+            libpixman-1-dev \
+            libepoxy-dev \
+            libfontenc-dev \
+            libfreetype-dev \
+            libudev-dev \
+            libsystemd-dev \
+            libselinux1-dev \
+            libunwind-dev \
+            libaudit-dev \
+            libinput-dev \
+            libevdev-dev \
+            libmtdev-dev \
+            libpciaccess-dev \
+            libxcvt-dev \
+            llvm-dev \
+            libclang-dev \
+            libelf-dev \
+            zlib1g-dev
+
+      - name: Create build directories
+        run: |
+          rm -rf source build package-root
+
+          mkdir -p \
+            source \
+            build \
+            package-root \
+            "pkgs/${ARCH}"
+
+      # ============================================================
+      # Mesa
+      # ============================================================
+
+      - name: Download Mesa
+        if: matrix.package == 'mesa'
+        working-directory: source
+        run: |
+          wget --https-only \
+            "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
+
+          tar -xf "mesa-${MESA_VERSION}.tar.xz"
+
+      - name: Configure Mesa
+        if: matrix.package == 'mesa'
+        run: |
+          meson setup \
+            build/mesa \
+            "source/mesa-${MESA_VERSION}" \
+            --prefix=/usr \
+            --libdir=lib \
+            --buildtype=release \
+            -Dbuild-tests=false \
+            -Dplatforms=x11,wayland \
+            -Dgallium-drivers=swrast,virgl \
+            -Dvulkan-drivers=swrast \
+            -Dglx=dri \
+            -Degl=enabled \
+            -Dgbm=enabled \
+            -Dllvm=enabled \
+            -Dshared-glapi=enabled
+
+      - name: Build and install Mesa
+        if: matrix.package == 'mesa'
+        run: |
+          meson compile \
+            -C build/mesa \
+            -j "$(nproc)"
+
+          DESTDIR="$GITHUB_WORKSPACE/package-root" \
+            meson install -C build/mesa
+
+          find package-root/usr/lib \
+            -maxdepth 3 \
+            -type f \
+            | head -30
+
+      # ============================================================
+      # X.Org Server
+      # ============================================================
+
+      - name: Download X.Org Server
+        if: matrix.package == 'xorg-server'
+        working-directory: source
+        run: |
+          wget --https-only \
+            "https://www.x.org/releases/individual/xserver/xorg-server-${XORG_SERVER_VERSION}.tar.xz"
+
+          tar -xf "xorg-server-${XORG_SERVER_VERSION}.tar.xz"
+
+      - name: Configure X.Org Server
+        if: matrix.package == 'xorg-server'
+        run: |
+          meson setup \
+            build/xorg-server \
+            "source/xorg-server-${XORG_SERVER_VERSION}" \
+            --prefix=/usr \
+            --libdir=lib \
+            --sysconfdir=/etc \
+            --localstatedir=/var \
+            --buildtype=release \
+            -Dxorg=true \
+            -Dxwayland=false \
+            -Dxnest=false \
+            -Dxvfb=false \
+            -Dxephyr=false \
+            -Dglamor=true \
+            -Dudev=true \
+            -Dsystemd_logind=false
+
+      - name: Build and install X.Org Server
+        if: matrix.package == 'xorg-server'
+        run: |
+          meson compile \
+            -C build/xorg-server \
+            -j "$(nproc)"
+
+          DESTDIR="$GITHUB_WORKSPACE/package-root" \
+            meson install -C build/xorg-server
+
+          test -x package-root/usr/bin/Xorg
+          file package-root/usr/bin/Xorg
+
+      # ============================================================
+      # xf86-input-libinput
+      # ============================================================
+
+      - name: Download X.Org libinput driver
+        if: matrix.package == 'xorg-input-libinput'
+        working-directory: source
+        run: |
+          wget --https-only \
+            "https://www.x.org/releases/individual/driver/xf86-input-libinput-${LIBINPUT_DRIVER_VERSION}.tar.xz"
+
+          tar -xf \
+            "xf86-input-libinput-${LIBINPUT_DRIVER_VERSION}.tar.xz"
+
+      - name: Build and install X.Org libinput driver
+        if: matrix.package == 'xorg-input-libinput'
+        run: |
+          cd \
+            "source/xf86-input-libinput-${LIBINPUT_DRIVER_VERSION}"
+
+          ./configure \
+            --prefix=/usr \
+            --libdir=/usr/lib \
+            --sysconfdir=/etc
+
+          make -j"$(nproc)"
+
+          make \
+            DESTDIR="$GITHUB_WORKSPACE/package-root" \
+            install
+
+          find "$GITHUB_WORKSPACE/package-root/usr/lib" \
+            -name '*libinput*' \
+            -o -name 'libinput_drv.so'
+
+      # ============================================================
+      # Metadata
+      # ============================================================
+
+      - name: Determine WishOS metadata
+        id: metadata
+        shell: bash
+        run: |
+          case "${{ matrix.package }}" in
+            mesa)
+              DESCRIPTION="Mesa OpenGL, EGL and Vulkan stack"
+              LICENSE="MIT"
+              DEPENDS="glibc,libdrm,libelf,libx11,libxcb,wayland,zlib"
+              ;;
+
+            xorg-server)
+              DESCRIPTION="X.Org display server"
+              LICENSE="MIT"
+              DEPENDS="glibc,libdrm,libepoxy,libinput,libpixman,libudev,libx11,libxcb"
+              ;;
+
+            xorg-input-libinput)
+              DESCRIPTION="X.Org libinput input driver"
+              LICENSE="MIT"
+              DEPENDS="glibc,libinput,xorg-server"
+              ;;
+
+            *)
+              echo "Unknown package: ${{ matrix.package }}" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "description=$DESCRIPTION" >> "$GITHUB_OUTPUT"
+          echo "license=$LICENSE" >> "$GITHUB_OUTPUT"
+          echo "depends=$DEPENDS" >> "$GITHUB_OUTPUT"
+
+      - name: Verify package is not empty
+        run: |
+          FILE_COUNT="$(
+            find package-root \
+              -type f \
+              -o -type l |
+            wc -l
+          )"
+
+          echo "Installed file count: $FILE_COUNT"
+
+          if [ "$FILE_COUNT" -lt 2 ]; then
+            echo "Package root is unexpectedly empty." >&2
+            exit 1
+          fi
+
+      - name: Add WishOS metadata
+        run: |
+          mkdir -p package-root/WISH
+
+          cat > package-root/WISH/info <<EOF
+          name=${{ matrix.package }}
+          version=${{ matrix.version }}
+          release=${PACKAGE_RELEASE}
+          arch=${ARCH}
+          description=${{ steps.metadata.outputs.description }}
+          license=${{ steps.metadata.outputs.license }}
+          depends=${{ steps.metadata.outputs.depends }}
+          EOF
+
+          find package-root \
+            -mindepth 1 \
+            ! -path 'package-root/WISH/files' \
+            -printf '%P\n' \
+            | sort \
+            > package-root/WISH/files
+
+      - name: Create .wsh package
+        id: package
+        shell: bash
+        run: |
+          PACKAGE_FILE="${{ matrix.package }}-${{ matrix.version }}-${PACKAGE_RELEASE}-${ARCH}.wsh"
+          PACKAGE_PATH="pkgs/${ARCH}/${PACKAGE_FILE}"
+
+          tar \
+            --numeric-owner \
+            --owner=0 \
+            --group=0 \
+            -C package-root \
+            -czf "$PACKAGE_PATH" \
+            .
+
+          HASH="$(
+            sha256sum "$PACKAGE_PATH" |
+            awk '{print $1}'
+          )"
+
+          printf '%s  %s\n' \
+            "$HASH" \
+            "$PACKAGE_FILE" \
+            > "${PACKAGE_PATH}.sha256"
+
+          echo "file=$PACKAGE_FILE" >> "$GITHUB_OUTPUT"
+
+          echo "Created:"
+          ls -lh \
+            "$PACKAGE_PATH" \
+            "${PACKAGE_PATH}.sha256"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wishpkgs-${{ matrix.package }}-${{ env.ARCH }}
+          path: |
+            pkgs/${{ env.ARCH }}/${{ steps.package.outputs.file }}
+            pkgs/${{ env.ARCH }}/${{ steps.package.outputs.file }}.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Publish AArch64 graphics packages
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Download graphics artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wishpkgs-*-aarch64
+          path: downloaded-packages
+          merge-multiple: true
+
+      - name: Copy packages into repository
+        run: |
+          mkdir -p pkgs/aarch64
+
+          find downloaded-packages \
+            -maxdepth 1 \
+            -type f \
+            \( -name '*.wsh' -o -name '*.wsh.sha256' \) \
+            -exec cp -v '{}' pkgs/aarch64/ ';'
+
+          echo
+          echo "Packages ready:"
+          find pkgs/aarch64 \
+            -maxdepth 1 \
+            -type f \
+            | sort
+
+      - name: Commit packages
+        run: |
+          git config \
+            user.name \
+            "WishOS Build Bot"
+
+          git config \
+            user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add pkgs/aarch64/
+
+          if git diff --cached --quiet; then
+            echo "No package changes."
+            exit 0
+          fi
+
+          git commit \
+            -m "build: update AArch64 graphics packages"
+
+          git pull \
+            --rebase \
+            origin main
+
+          git push \
+            origin HEAD:main
