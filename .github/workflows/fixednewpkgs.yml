@@ -11,12 +11,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  ARCH: aarch64
+  ARCH: "aarch64"
   PACKAGE_RELEASE: "1"
 
-  XORG_SERVER_VERSION: "21.1.24"
   MESA_VERSION: "24.0.8"
-  LIBINPUT_DRIVER_VERSION: "1.4.0"
+  XORG_SERVER_VERSION: "21.1.23"
+  XORG_LIBINPUT_VERSION: "1.5.0"
 
 jobs:
   build:
@@ -30,10 +30,10 @@ jobs:
             version: "24.0.8"
 
           - package: xorg-server
-            version: "21.1.24"
+            version: "21.1.23"
 
           - package: xorg-input-libinput
-            version: "1.4.0"
+            version: "1.5.0"
 
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 180
@@ -42,37 +42,44 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install common build dependencies
+      - name: Install common build tools
         run: |
+          set -eux
+
           sudo apt-get update
 
           sudo apt-get install -y \
             build-essential \
+            autoconf \
+            automake \
+            autopoint \
+            libtool \
             pkg-config \
             meson \
             ninja-build \
             cmake \
-            autoconf \
-            automake \
-            libtool \
-            xutils-dev \
-            wget \
-            curl \
-            file \
-            git \
-            tar \
-            gzip \
-            bzip2 \
-            xz-utils \
             python3 \
             python3-mako \
             python3-packaging \
+            python3-ply \
             python3-setuptools \
+            python3-yaml \
             flex \
-            bison
+            bison \
+            xutils-dev \
+            wget \
+            curl \
+            git \
+            file \
+            tar \
+            gzip \
+            bzip2 \
+            xz-utils
 
-      - name: Install graphics build dependencies
+      - name: Install graphics development packages
         run: |
+          set -eux
+
           sudo apt-get install -y \
             libdrm-dev \
             libgbm-dev \
@@ -81,6 +88,7 @@ jobs:
             libglvnd-dev \
             libglx-dev \
             libwayland-dev \
+            libwayland-egl-backend-dev \
             wayland-protocols \
             libx11-dev \
             libx11-xcb-dev \
@@ -118,13 +126,19 @@ jobs:
             libmtdev-dev \
             libpciaccess-dev \
             libxcvt-dev \
+            libelf-dev \
+            libexpat1-dev \
+            libzstd-dev \
+            zlib1g-dev \
             llvm-dev \
             libclang-dev \
-            libelf-dev \
-            zlib1g-dev
+            xserver-xorg-dev \
+            x11proto-dev
 
-      - name: Create build directories
+      - name: Create working directories
         run: |
+          set -eux
+
           rm -rf source build package-root
 
           mkdir -p \
@@ -141,20 +155,40 @@ jobs:
         if: matrix.package == 'mesa'
         working-directory: source
         run: |
+          set -eux
+
           wget --https-only \
             "https://archive.mesa3d.org/mesa-${MESA_VERSION}.tar.xz"
 
           tar -xf "mesa-${MESA_VERSION}.tar.xz"
 
+      - name: Verify Mesa dependencies
+        if: matrix.package == 'mesa'
+        run: |
+          set -eux
+
+          pkg-config --modversion libdrm
+          pkg-config --modversion libudev
+          pkg-config --modversion wayland-client
+          pkg-config --modversion wayland-server
+          pkg-config --modversion wayland-egl-backend
+          pkg-config --modversion x11
+          pkg-config --modversion xcb
+          pkg-config --modversion expat
+          llvm-config --version
+
       - name: Configure Mesa
         if: matrix.package == 'mesa'
         run: |
+          set -eux
+
           meson setup \
             build/mesa \
             "source/mesa-${MESA_VERSION}" \
             --prefix=/usr \
             --libdir=lib \
             --buildtype=release \
+            --wrap-mode=nodownload \
             -Dbuild-tests=false \
             -Dplatforms=x11,wayland \
             -Dgallium-drivers=swrast,virgl \
@@ -168,6 +202,8 @@ jobs:
       - name: Build and install Mesa
         if: matrix.package == 'mesa'
         run: |
+          set -eux
+
           meson compile \
             -C build/mesa \
             -j "$(nproc)"
@@ -175,10 +211,12 @@ jobs:
           DESTDIR="$GITHUB_WORKSPACE/package-root" \
             meson install -C build/mesa
 
+          test -d package-root/usr/lib
+
           find package-root/usr/lib \
-            -maxdepth 3 \
-            -type f \
-            | head -30
+            -maxdepth 4 \
+            \( -type f -o -type l \) \
+            | head -50
 
       # ============================================================
       # X.Org Server
@@ -188,14 +226,33 @@ jobs:
         if: matrix.package == 'xorg-server'
         working-directory: source
         run: |
+          set -eux
+
           wget --https-only \
             "https://www.x.org/releases/individual/xserver/xorg-server-${XORG_SERVER_VERSION}.tar.xz"
 
-          tar -xf "xorg-server-${XORG_SERVER_VERSION}.tar.xz"
+          tar -xf \
+            "xorg-server-${XORG_SERVER_VERSION}.tar.xz"
+
+      - name: Verify X.Org Server dependencies
+        if: matrix.package == 'xorg-server'
+        run: |
+          set -eux
+
+          pkg-config --modversion pixman-1
+          pkg-config --modversion libdrm
+          pkg-config --modversion libudev
+          pkg-config --modversion libepoxy
+          pkg-config --modversion xkbfile
+          pkg-config --modversion xfont2
+          pkg-config --modversion pciaccess
+          pkg-config --modversion libxcvt
 
       - name: Configure X.Org Server
         if: matrix.package == 'xorg-server'
         run: |
+          set -eux
+
           meson setup \
             build/xorg-server \
             "source/xorg-server-${XORG_SERVER_VERSION}" \
@@ -204,8 +261,8 @@ jobs:
             --sysconfdir=/etc \
             --localstatedir=/var \
             --buildtype=release \
+            --wrap-mode=nodownload \
             -Dxorg=true \
-            -Dxwayland=false \
             -Dxnest=false \
             -Dxvfb=false \
             -Dxephyr=false \
@@ -213,9 +270,16 @@ jobs:
             -Dudev=true \
             -Dsystemd_logind=false
 
+      - name: Show X.Org configuration
+        if: matrix.package == 'xorg-server'
+        run: |
+          meson configure build/xorg-server
+
       - name: Build and install X.Org Server
         if: matrix.package == 'xorg-server'
         run: |
+          set -eux
+
           meson compile \
             -C build/xorg-server \
             -j "$(nproc)"
@@ -230,26 +294,53 @@ jobs:
       # xf86-input-libinput
       # ============================================================
 
-      - name: Download X.Org libinput driver
+      - name: Download xf86-input-libinput
         if: matrix.package == 'xorg-input-libinput'
         working-directory: source
         run: |
+          set -eux
+
           wget --https-only \
-            "https://www.x.org/releases/individual/driver/xf86-input-libinput-${LIBINPUT_DRIVER_VERSION}.tar.xz"
+            "https://www.x.org/releases/individual/driver/xf86-input-libinput-${XORG_LIBINPUT_VERSION}.tar.xz"
 
           tar -xf \
-            "xf86-input-libinput-${LIBINPUT_DRIVER_VERSION}.tar.xz"
+            "xf86-input-libinput-${XORG_LIBINPUT_VERSION}.tar.xz"
 
-      - name: Build and install X.Org libinput driver
+      - name: Verify input-driver dependencies
         if: matrix.package == 'xorg-input-libinput'
         run: |
-          cd \
-            "source/xf86-input-libinput-${LIBINPUT_DRIVER_VERSION}"
+          set -eux
+
+          pkg-config --modversion xorg-server
+          pkg-config --modversion xproto
+          pkg-config --modversion inputproto
+          pkg-config --modversion libinput
+
+          pkg-config \
+            --cflags \
+            xorg-server xproto inputproto libinput
+
+      - name: Configure xf86-input-libinput
+        if: matrix.package == 'xorg-input-libinput'
+        working-directory: source
+        run: |
+          set -eux
+
+          cd "xf86-input-libinput-${XORG_LIBINPUT_VERSION}"
 
           ./configure \
             --prefix=/usr \
             --libdir=/usr/lib \
-            --sysconfdir=/etc
+            --sysconfdir=/etc \
+            --disable-static
+
+      - name: Build and install xf86-input-libinput
+        if: matrix.package == 'xorg-input-libinput'
+        working-directory: source
+        run: |
+          set -eux
+
+          cd "xf86-input-libinput-${XORG_LIBINPUT_VERSION}"
 
           make -j"$(nproc)"
 
@@ -257,33 +348,36 @@ jobs:
             DESTDIR="$GITHUB_WORKSPACE/package-root" \
             install
 
-          find "$GITHUB_WORKSPACE/package-root/usr/lib" \
-            -name '*libinput*' \
-            -o -name 'libinput_drv.so'
+          DRIVER="$GITHUB_WORKSPACE/package-root/usr/lib/xorg/modules/input/libinput_drv.so"
+
+          test -f "$DRIVER"
+          file "$DRIVER"
 
       # ============================================================
-      # Metadata
+      # WishOS metadata
       # ============================================================
 
-      - name: Determine WishOS metadata
+      - name: Determine package metadata
         id: metadata
         shell: bash
         run: |
+          set -eu
+
           case "${{ matrix.package }}" in
             mesa)
-              DESCRIPTION="Mesa OpenGL, EGL and Vulkan stack"
+              DESCRIPTION="Mesa OpenGL, EGL, GBM and Vulkan graphics stack"
               LICENSE="MIT"
-              DEPENDS="glibc,libdrm,libelf,libx11,libxcb,wayland,zlib"
+              DEPENDS="glibc,libdrm,libelf,libexpat,libx11,libxcb,libudev,wayland,zlib,zstd"
               ;;
 
             xorg-server)
-              DESCRIPTION="X.Org display server"
+              DESCRIPTION="X.Org display server for WishOS"
               LICENSE="MIT"
-              DEPENDS="glibc,libdrm,libepoxy,libinput,libpixman,libudev,libx11,libxcb"
+              DEPENDS="glibc,libdrm,libepoxy,libpciaccess,libpixman,libudev,libx11,libxcb,libxfont,libxkbfile"
               ;;
 
             xorg-input-libinput)
-              DESCRIPTION="X.Org libinput input driver"
+              DESCRIPTION="X.Org input driver using libinput"
               LICENSE="MIT"
               DEPENDS="glibc,libinput,xorg-server"
               ;;
@@ -298,24 +392,48 @@ jobs:
           echo "license=$LICENSE" >> "$GITHUB_OUTPUT"
           echo "depends=$DEPENDS" >> "$GITHUB_OUTPUT"
 
-      - name: Verify package is not empty
+      - name: Verify package filesystem
         run: |
+          set -eux
+
           FILE_COUNT="$(
             find package-root \
-              -type f \
-              -o -type l |
-            wc -l
+              \( -type f -o -type l \) \
+              | wc -l
           )"
 
-          echo "Installed file count: $FILE_COUNT"
+          echo "Installed files and links: $FILE_COUNT"
 
-          if [ "$FILE_COUNT" -lt 2 ]; then
-            echo "Package root is unexpectedly empty." >&2
+          if [ "$FILE_COUNT" -lt 1 ]; then
+            echo "Package root is empty." >&2
             exit 1
           fi
 
-      - name: Add WishOS metadata
+          case "${{ matrix.package }}" in
+            mesa)
+              find package-root/usr/lib \
+                \( -name 'libEGL.so*' \
+                -o -name 'libGLX.so*' \
+                -o -name 'libgbm.so*' \
+                -o -name 'libgallium*.so*' \) \
+                -print |
+                grep .
+              ;;
+
+            xorg-server)
+              test -x package-root/usr/bin/Xorg
+              ;;
+
+            xorg-input-libinput)
+              test -f \
+                package-root/usr/lib/xorg/modules/input/libinput_drv.so
+              ;;
+          esac
+
+      - name: Add WishOS package metadata
         run: |
+          set -eux
+
           mkdir -p package-root/WISH
 
           cat > package-root/WISH/info <<EOF
@@ -335,10 +453,14 @@ jobs:
             | sort \
             > package-root/WISH/files
 
+          cat package-root/WISH/info
+
       - name: Create .wsh package
         id: package
         shell: bash
         run: |
+          set -eux
+
           PACKAGE_FILE="${{ matrix.package }}-${{ matrix.version }}-${PACKAGE_RELEASE}-${ARCH}.wsh"
           PACKAGE_PATH="pkgs/${ARCH}/${PACKAGE_FILE}"
 
@@ -362,10 +484,14 @@ jobs:
 
           echo "file=$PACKAGE_FILE" >> "$GITHUB_OUTPUT"
 
-          echo "Created:"
+          echo "Created WishOS package:"
           ls -lh \
             "$PACKAGE_PATH" \
             "${PACKAGE_PATH}.sha256"
+
+          echo
+          echo "First package entries:"
+          tar -tzf "$PACKAGE_PATH" | head -50
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
@@ -384,13 +510,13 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout main
+      - name: Checkout main branch
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
 
-      - name: Download graphics artifacts
+      - name: Download all graphics artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: wishpkgs-*-aarch64
@@ -399,6 +525,8 @@ jobs:
 
       - name: Copy packages into repository
         run: |
+          set -eux
+
           mkdir -p pkgs/aarch64
 
           find downloaded-packages \
@@ -407,15 +535,25 @@ jobs:
             \( -name '*.wsh' -o -name '*.wsh.sha256' \) \
             -exec cp -v '{}' pkgs/aarch64/ ';'
 
-          echo
-          echo "Packages ready:"
+          PACKAGE_COUNT="$(
+            find pkgs/aarch64 \
+              -maxdepth 1 \
+              -type f \
+              -name '*.wsh' \
+              | wc -l
+          )"
+
+          echo "Total AArch64 packages in repository: $PACKAGE_COUNT"
+
           find pkgs/aarch64 \
             -maxdepth 1 \
             -type f \
             | sort
 
-      - name: Commit packages
+      - name: Commit packages to main
         run: |
+          set -eux
+
           git config \
             user.name \
             "WishOS Build Bot"
@@ -427,7 +565,7 @@ jobs:
           git add pkgs/aarch64/
 
           if git diff --cached --quiet; then
-            echo "No package changes."
+            echo "No package changes to commit."
             exit 0
           fi
 
