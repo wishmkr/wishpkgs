@@ -15,7 +15,7 @@ env:
   PACKAGE_RELEASE: "1"
 
   MESA_VERSION: "24.0.8"
-  XORG_SERVER_VERSION: "21.1.23"
+  XORG_SERVER_VERSION: "21.1.24"
   XORG_LIBINPUT_VERSION: "1.5.0"
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
             version: "24.0.8"
 
           - package: xorg-server
-            version: "21.1.23"
+            version: "21.1.24"
 
           - package: xorg-input-libinput
             version: "1.5.0"
@@ -216,7 +216,7 @@ jobs:
           find package-root/usr/lib \
             -maxdepth 4 \
             \( -type f -o -type l \) \
-            | head -50
+            | sed -n '1,50p'
 
       # ============================================================
       # X.Org Server
@@ -242,7 +242,7 @@ jobs:
           pkg-config --modversion pixman-1
           pkg-config --modversion libdrm
           pkg-config --modversion libudev
-          pkg-config --modversion libepoxy
+          pkg-config --modversion epoxy
           pkg-config --modversion xkbfile
           pkg-config --modversion xfont2
           pkg-config --modversion pciaccess
@@ -306,7 +306,7 @@ jobs:
           tar -xf \
             "xf86-input-libinput-${XORG_LIBINPUT_VERSION}.tar.xz"
 
-      - name: Verify input-driver dependencies
+      - name: Verify input driver dependencies
         if: matrix.package == 'xorg-input-libinput'
         run: |
           set -eux
@@ -318,7 +318,10 @@ jobs:
 
           pkg-config \
             --cflags \
-            xorg-server xproto inputproto libinput
+            xorg-server \
+            xproto \
+            inputproto \
+            libinput
 
       - name: Configure xf86-input-libinput
         if: matrix.package == 'xorg-input-libinput'
@@ -412,12 +415,14 @@ jobs:
           case "${{ matrix.package }}" in
             mesa)
               find package-root/usr/lib \
-                \( -name 'libEGL.so*' \
-                -o -name 'libGLX.so*' \
-                -o -name 'libgbm.so*' \
-                -o -name 'libgallium*.so*' \) \
-                -print |
-                grep .
+                \( \
+                  -name 'libEGL.so*' \
+                  -o -name 'libGL.so*' \
+                  -o -name 'libgbm.so*' \
+                  -o -name '*_dri.so' \
+                \) \
+                -print \
+                | grep .
               ;;
 
             xorg-server)
@@ -463,6 +468,7 @@ jobs:
 
           PACKAGE_FILE="${{ matrix.package }}-${{ matrix.version }}-${PACKAGE_RELEASE}-${ARCH}.wsh"
           PACKAGE_PATH="pkgs/${ARCH}/${PACKAGE_FILE}"
+          CONTENTS_FILE="$RUNNER_TEMP/${{ matrix.package }}-package-contents.txt"
 
           tar \
             --numeric-owner \
@@ -485,13 +491,26 @@ jobs:
           echo "file=$PACKAGE_FILE" >> "$GITHUB_OUTPUT"
 
           echo "Created WishOS package:"
+
           ls -lh \
             "$PACKAGE_PATH" \
             "${PACKAGE_PATH}.sha256"
 
           echo
           echo "First package entries:"
-          tar -tzf "$PACKAGE_PATH" | head -50
+
+          tar -tzf "$PACKAGE_PATH" > "$CONTENTS_FILE"
+          sed -n '1,50p' "$CONTENTS_FILE"
+
+          echo
+          echo "Total package entries:"
+          wc -l < "$CONTENTS_FILE"
+
+          echo
+          echo "Testing package archive:"
+          tar -tzf "$PACKAGE_PATH" > /dev/null
+
+          echo "Package archive is valid."
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
@@ -535,15 +554,23 @@ jobs:
             \( -name '*.wsh' -o -name '*.wsh.sha256' \) \
             -exec cp -v '{}' pkgs/aarch64/ ';'
 
-          PACKAGE_COUNT="$(
-            find pkgs/aarch64 \
+          NEW_PACKAGE_COUNT="$(
+            find downloaded-packages \
               -maxdepth 1 \
               -type f \
               -name '*.wsh' \
               | wc -l
           )"
 
-          echo "Total AArch64 packages in repository: $PACKAGE_COUNT"
+          echo "Downloaded packages: $NEW_PACKAGE_COUNT"
+
+          if [ "$NEW_PACKAGE_COUNT" -ne 3 ]; then
+            echo "Expected three graphics packages." >&2
+            exit 1
+          fi
+
+          echo
+          echo "Packages ready for publishing:"
 
           find pkgs/aarch64 \
             -maxdepth 1 \
