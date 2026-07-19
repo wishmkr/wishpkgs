@@ -89,7 +89,7 @@ jobs:
 
           tar -xf "busybox-${BUSYBOX_VERSION}.tar.bz2"
 
-            - name: Configure BusyBox
+      - name: Configure BusyBox
         if: matrix.package == 'busybox'
         working-directory: source
         run: |
