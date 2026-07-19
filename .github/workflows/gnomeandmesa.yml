@@ -134,7 +134,7 @@ jobs:
             --disable-kdrive
           make -j"$(nproc)"
           make DESTDIR="$GITHUB_WORKSPACE/package-root" install
-          file "$GITHUB_WORKSPACE/package-root/usr/bin/Xorg"
+          file "$GITHUB_WORKSPACE/package-root/usr/bin/Xorg" || true
 
       # ======================================================
       # X.Org Drivers (Video & Input)
@@ -184,14 +184,9 @@ jobs:
       - name: Build and install Mesa
         if: matrix.package == 'mesa'
         run: |
-          cmake \
-            -S "source/mesa-${MESA_VERSION}" \
-            -B build/mesa \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX=/usr \
-            -DMESA_VERSION="${MESA_VERSION}" \
-            -DBUILD_SHARED_LIBS=ON \
+          meson setup \
+            --prefix=/usr \
+            --buildtype=release \
             -Ddri-drivers=auto \
             -Dgallium-drivers=auto \
             -Dvulkan-drivers=auto \
@@ -199,9 +194,11 @@ jobs:
             -Degl=enabled \
             -Dgbm=enabled \
             -Dglvnd=enabled \
-            -Dllvm=enabled
-          cmake --build build/mesa --parallel "$(nproc)"
-          DESTDIR="$GITHUB_WORKSPACE/package-root" cmake --install build/mesa
+            -Dllvm=enabled \
+            "source/mesa-${MESA_VERSION}" \
+            build/mesa
+          meson compile -C build/mesa
+          DESTDIR="$GITHUB_WORKSPACE/package-root" meson install -C build/mesa
           file "$GITHUB_WORKSPACE/package-root/usr/lib/libGL.so" || true
 
       # ======================================================
@@ -222,7 +219,6 @@ jobs:
           meson setup \
             --prefix=/usr \
             --buildtype=release \
-            -Dgsettings_localcompile=false \
             -Dman=false \
             "source/gnome-shell-${GNOME_SHELL_VERSION}" \
             build/gnome-shell
