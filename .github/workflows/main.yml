@@ -89,7 +89,7 @@ jobs:
 
           tar -xf "busybox-${BUSYBOX_VERSION}.tar.bz2"
 
-      - name: Configure BusyBox
+            - name: Configure BusyBox
         if: matrix.package == 'busybox'
         working-directory: source
         run: |
@@ -109,10 +109,14 @@ jobs:
             echo 'CONFIG_STATIC=y' >> .config
           fi
 
+          # Disable TC tool due to kernel header compatibility issues
+          sed -i 's/^CONFIG_TC=.*/# CONFIG_TC is not set/' .config
+          echo '# CONFIG_TC is not set' >> .config
+
           yes "" | make oldconfig
 
           grep '^CONFIG_STATIC=y' .config
-
+          
       - name: Build and install BusyBox
         if: matrix.package == 'busybox'
         working-directory: source
