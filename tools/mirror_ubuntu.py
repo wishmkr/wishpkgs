@@ -270,6 +270,15 @@ def merge_index(arch, own_index_path, state_dir):
         if b2_get(f"index/{arch}/shard{s}.txt", tmp):
             with open(tmp) as f:
                 lines.update(l.strip() for l in f if l.strip())
+    # Defensive: a shard that started before a purge ran is still carrying
+    # the purged names in its own local index file (nothing ever removes
+    # them from there mid-run), and the union above would otherwise merge
+    # them straight back into the canonical file on every flush, silently
+    # undoing the purge for as long as that shard keeps running. Filtering
+    # here -- not just at todo-build time -- makes a block permanent
+    # regardless of what any already-running process still has cached.
+    lines = {l for l in lines if not is_blocked(l)}
+
     merged_path = os.path.join(state_dir, f"{arch}.merged.index")
     with open(merged_path, "w") as f:
         f.writelines(f"{l}\n" for l in sorted(lines))
