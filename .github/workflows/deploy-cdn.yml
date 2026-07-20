@@ -1,0 +1,61 @@
+name: Deploy cdn.wishpkgs.org (Cloudflare Worker -> B2)
+
+# One-shot setup: deploys a Cloudflare Worker that proxies cdn.wishpkgs.org to
+# the public Backblaze B2 bucket, and binds the custom domain. Re-runnable.
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      WORKER_NAME: wishpkgs-cdn
+      DOMAIN: cdn.wishpkgs.org
+      ZONE_NAME: wishpkgs.org
+      B2_BASE: https://s3.eu-central-003.backblazeb2.com/wishpkgs
+    steps:
+      - name: Deploy Worker + bind custom domain
+        run: |
+          set -euo pipefail
+          API=https://api.cloudflare.com/client/v4
+          auth=(-H "Authorization: Bearer $CF_API_TOKEN")
+
+          echo "== Resolve zone + account =="
+          ZONE_JSON=$(curl -s "${auth[@]}" "$API/zones?name=$ZONE_NAME")
+          ZONE_ID=$(echo "$ZONE_JSON" | jq -r '.result[0].id')
+          ACCT_ID=$(echo "$ZONE_JSON" | jq -r '.result[0].account.id')
+          echo "zone=$ZONE_ID account=$ACCT_ID"
+          test "$ZONE_ID" != "null" -a -n "$ZONE_ID"
+
+          echo "== Write Worker script =="
+          cat > worker.js <<'JS'
+          export default {
+            async fetch(request) {
+              const B2 = "https://s3.eu-central-003.backblazeb2.com/wishpkgs";
+              const url = new URL(request.url);
+              const resp = await fetch(B2 + url.pathname, {
+                cf: { cacheEverything: true, cacheTtl: 3600 }
+              });
+              return new Response(resp.body, { status: resp.status, headers: resp.headers });
+            }
+          }
+          JS
+
+          echo "== Upload Worker (module) =="
+          UP=$(curl -s -X PUT "${auth[@]}" \
+            "$API/accounts/$ACCT_ID/workers/scripts/$WORKER_NAME" \
+            -F 'metadata={"main_module":"worker.js"};type=application/json' \
+            -F 'worker.js=@worker.js;type=application/javascript+module')
+          echo "$UP" | jq -r '{success, errors}'
+          test "$(echo "$UP" | jq -r '.success')" = "true"
+
+          echo "== Bind custom domain $DOMAIN =="
+          DOM=$(curl -s -X PUT "${auth[@]}" \
+            "$API/accounts/$ACCT_ID/workers/domains" \
+            -H "Content-Type: application/json" \
+            -d "{\"zone_id\":\"$ZONE_ID\",\"hostname\":\"$DOMAIN\",\"service\":\"$WORKER_NAME\",\"environment\":\"production\"}")
+          echo "$DOM" | jq -r '{success, errors, result}'
+
+          echo "== Done. Test: https://$DOMAIN/index/aarch64.txt =="
