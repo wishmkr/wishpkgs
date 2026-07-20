@@ -58,4 +58,10 @@ jobs:
             -d "{\"zone_id\":\"$ZONE_ID\",\"hostname\":\"$DOMAIN\",\"service\":\"$WORKER_NAME\",\"environment\":\"production\"}")
           echo "$DOM" | jq -r '{success, errors, result}'
 
+          # Same reasoning as deploy-lib.yml: redeploying code doesn't evict
+          # already-cached upstream responses, so purge on every deploy.
+          PURGE=$(curl -s -X POST "${auth[@]}" "$API/zones/$ZONE_ID/purge_cache" \
+            -H "Content-Type: application/json" -d '{"purge_everything":true}')
+          echo "purge:"; echo "$PURGE" | jq -r '{success, errors}'
+
           echo "== Done. Test: https://$DOMAIN/index/aarch64.txt =="
