@@ -1,0 +1,7 @@
+name=curl
+version=8.21.0
+release=1
+arch=aarch64
+description=Command line URL transfer utility
+license=curl
+depends=glibc,openssl,zlib

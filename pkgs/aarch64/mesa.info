@@ -1,0 +1,7 @@
+name=mesa
+version=24.0.8
+release=1
+arch=aarch64
+description=Mesa OpenGL, EGL, GBM and Vulkan graphics stack
+license=MIT
+depends=glibc,libdrm,libelf,libexpat,libx11,libxcb,libudev,wayland,zlib,zstd

@@ -591,6 +591,26 @@ jobs:
             -type f \
             | sort
 
+      - name: Generate repo index and .info sidecars
+        run: |
+          set -eux
+          # wish reads pkgs/<arch>/<name>.info + index/<arch>.txt (not inside the
+          # .wsh). Derive them from each package's embedded WISH/info.
+          for archdir in pkgs/*/; do
+            [ -d "$archdir" ] || continue
+            arch=$(basename "$archdir")
+            for wsh in "$archdir"*.wsh; do
+              [ -e "$wsh" ] || continue
+              base=$(basename "$wsh")
+              name=$(echo "$base" | sed -E 's/^([a-z0-9-]+)-[0-9.]+-[0-9]+-[a-z0-9_]+\.wsh$/\1/')
+              tar -xzOf "$wsh" ./WISH/info > "$archdir$name.info" 2>/dev/null \
+                || tar -xzOf "$wsh" WISH/info > "$archdir$name.info" 2>/dev/null \
+                || echo "warning: no WISH/info in $base"
+            done
+            mkdir -p index
+            ( cd "$archdir" && ls -1 *.wsh 2>/dev/null ) > "index/$arch.txt"
+          done
+
       - name: Commit packages to main
         run: |
           set -eux
@@ -603,7 +623,7 @@ jobs:
             user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add pkgs/aarch64/
+          git add pkgs/aarch64/ index/
 
           if git diff --cached --quiet; then
             echo "No package changes to commit."

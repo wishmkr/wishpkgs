@@ -1,0 +1,7 @@
+name=fastfetch
+version=2.66.0
+release=1
+arch=aarch64
+description=Fast system information utility
+license=MIT
+depends=glibc

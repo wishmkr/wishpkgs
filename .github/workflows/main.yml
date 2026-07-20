@@ -402,6 +402,29 @@ jobs:
           echo "Packages ready for publishing:"
           find pkgs -maxdepth 2 -type f -print | sort
 
+      - name: Generate repo index and .info sidecars
+        run: |
+          set -eux
+          # The wish package manager reads metadata from pkgs/<arch>/<name>.info
+          # and the package list from index/<arch>.txt -- neither is inside the
+          # .wsh files, so derive them here from each package's WISH/info.
+          for archdir in pkgs/*/; do
+            [ -d "$archdir" ] || continue
+            arch=$(basename "$archdir")
+            for wsh in "$archdir"*.wsh; do
+              [ -e "$wsh" ] || continue
+              base=$(basename "$wsh")
+              name=$(echo "$base" | sed -E 's/^([a-z0-9-]+)-[0-9.]+-[0-9]+-[a-z0-9_]+\.wsh$/\1/')
+              tar -xzOf "$wsh" ./WISH/info > "$archdir$name.info" 2>/dev/null \
+                || tar -xzOf "$wsh" WISH/info > "$archdir$name.info" 2>/dev/null \
+                || echo "warning: no WISH/info in $base"
+            done
+            mkdir -p index
+            ( cd "$archdir" && ls -1 *.wsh 2>/dev/null ) > "index/$arch.txt"
+          done
+          echo "Generated index + .info:"
+          find index pkgs -name '*.info' -o -name 'index/*.txt' | sort
+
       - name: Commit packages to main
         run: |
           git config \
@@ -412,7 +435,7 @@ jobs:
             user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add pkgs/
+          git add pkgs/ index/
 
           if git diff --cached --quiet; then
             echo "No package changes to commit."

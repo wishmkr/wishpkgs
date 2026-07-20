@@ -1,0 +1,7 @@
+busybox-1.36.1-1-aarch64.wsh
+curl-8.21.0-1-aarch64.wsh
+fastfetch-2.66.0-1-aarch64.wsh
+htop-3.5.2-1-aarch64.wsh
+mesa-24.0.8-1-aarch64.wsh
+xorg-input-libinput-1.5.0-1-aarch64.wsh
+xorg-server-21.1.24-1-aarch64.wsh

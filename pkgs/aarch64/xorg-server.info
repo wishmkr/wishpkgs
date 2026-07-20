@@ -1,0 +1,7 @@
+name=xorg-server
+version=21.1.24
+release=1
+arch=aarch64
+description=X.Org display server for WishOS
+license=MIT
+depends=glibc,libdrm,libepoxy,libpciaccess,libpixman,libudev,libx11,libxcb,libxfont,libxkbfile

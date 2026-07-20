@@ -1,0 +1,7 @@
+name=htop
+version=3.5.2
+release=1
+arch=aarch64
+description=Interactive process viewer
+license=GPL-2.0-or-later
+depends=glibc,ncurses

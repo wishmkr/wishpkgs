@@ -1,0 +1,7 @@
+name=busybox
+version=1.36.1
+release=1
+arch=aarch64
+description=BusyBox base utilities for WishOS
+license=GPL-2.0-only
+depends=
