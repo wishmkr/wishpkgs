@@ -2,6 +2,13 @@ name: Build WishOS Packages
 
 on:
   workflow_dispatch:
+  schedule:
+    # Weekly rebuild — Mondays 04:00 UTC (keeps base packages fresh)
+    - cron: "0 4 * * 1"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/main.yml"
 
 permissions:
   contents: write

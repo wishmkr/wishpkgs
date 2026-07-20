@@ -2,6 +2,9 @@ name: Build WishOS Graphics Base (AArch64)
 
 on:
   workflow_dispatch:
+  schedule:
+    # Monthly rebuild — 1st at 05:00 UTC (graphics builds are heavy, ~hours)
+    - cron: "0 5 1 * *"
 
 permissions:
   contents: write
