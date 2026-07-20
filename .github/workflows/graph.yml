@@ -146,7 +146,8 @@ jobs:
             x11-xkb-utils \
             libudev-dev \
             libsystemd-dev \
-            x11proto-dev
+            x11proto-dev \
+            libtirpc-dev
 
       - name: Create working directories
         run: |
