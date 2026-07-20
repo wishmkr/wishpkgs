@@ -3,11 +3,21 @@
 Repackage upstream .deb binaries into wish's .wsh package format and upload
 them straight to the B2 bucket that backs cdn.wishpkgs.org.
 
-Resumable by design: progress (done/failed package ids, the live per-arch
-index, and which arch is "current") is stored in B2 itself, so a fresh
-process -- whether started manually or by the workflow re-triggering itself
-after its internal deadline -- picks up exactly where the last one stopped,
-even if that one was mid-package when it got cut off.
+Runs as one shard of MIRROR_SHARDS (default 1, i.e. unsharded) working a
+single arch (MIRROR_ARCH) chosen by the caller -- the workflow's
+determine-arch job reads/advances state/current-arch.txt, not this script,
+since with multiple shards running concurrently only a single writer may
+ever flip that pointer. Each shard partitions the package list by a stable
+hash of the package name, so the same package always lands on the same
+shard across runs (never processed twice, never dropped).
+
+Resumable by design: progress (done/failed package ids, per-shard index)
+lives in B2 itself, so a fresh process -- whether started manually or by the
+workflow re-triggering itself after its internal deadline -- picks up
+exactly where the last one stopped, even mid-package. Per-shard files avoid
+concurrent-write races; the canonical index/<arch>.txt is produced by
+merging all shards' index files, refreshed periodically during the run (not
+just at the end) so newly-mirrored packages show up quickly.
 
 Only the two package archs wish actually uses are ever written:
   x86_64  <- upstream "amd64"  (archive.ubuntu.com)
@@ -33,16 +43,18 @@ import tempfile
 import time
 from urllib.request import urlopen
 
-DEADLINE = time.monotonic() + float(os.environ.get("MIRROR_DEADLINE_SECONDS", "19800"))  # 5h30m default
+DEADLINE = time.monotonic() + float(os.environ.get("MIRROR_DEADLINE_SECONDS", "19500"))
 RELEASE = os.environ.get("MIRROR_RELEASE", "noble")
 COMPONENTS = [c for c in os.environ.get("MIRROR_COMPONENTS", "main").split(",") if c]
 FLUSH_EVERY = int(os.environ.get("MIRROR_FLUSH_EVERY", "20"))
+ARCH = os.environ.get("MIRROR_ARCH", "aarch64")
+SHARD = int(os.environ.get("MIRROR_SHARD", "0"))
+NUM_SHARDS = max(1, int(os.environ.get("MIRROR_SHARDS", "1")))
 
 ARCHES = {
     "x86_64":  {"deb_arch": "amd64", "base": "http://archive.ubuntu.com/ubuntu"},
     "aarch64": {"deb_arch": "arm64", "base": "http://ports.ubuntu.com/ubuntu-ports"},
 }
-ARCH_ORDER = ["aarch64", "x86_64"]
 
 B2_ENDPOINT = "https://s3.eu-central-003.backblazeb2.com"
 B2_BUCKET = "wishpkgs"
@@ -54,6 +66,16 @@ def redact(text):
     """Drop literal distro-name mentions from text WE generate. Never applied
     to the package's own shipped files (copyright/license/docs stay verbatim)."""
     return _REDACT_RE.sub("the system", text) if text else text
+
+
+def in_shard(name):
+    """Stable partition: hashlib (not the built-in hash()) so the same
+    package always maps to the same shard across separate processes/runs --
+    Python's str hash() is randomized per-process by default."""
+    if NUM_SHARDS <= 1:
+        return True
+    digest = hashlib.md5(name.encode()).hexdigest()
+    return int(digest, 16) % NUM_SHARDS == SHARD
 
 
 def sh(cmd):
@@ -149,10 +171,13 @@ def load_state_set(key):
     return set()
 
 
-def process_package(arch_wish, base, pkg, workdir, index_path):
+def process_package(arch_wish, base, pkg, workdir):
+    """Downloads, repackages, and uploads one package. Returns the .wsh
+    filename on success, or None on failure -- the caller owns index/state
+    bookkeeping (this function only touches pkgs/<arch>/ in B2)."""
     name_raw, ver_raw, filename = pkg.get("Package"), pkg.get("Version"), pkg.get("Filename")
     if not (name_raw and ver_raw and filename):
-        return False
+        return None
 
     name = sanitize_name(name_raw)
     version = sanitize_version(ver_raw)
@@ -194,30 +219,54 @@ def process_package(arch_wish, base, pkg, workdir, index_path):
         b2_cp(wsh_path, f"pkgs/{arch_wish}/{wsh_name}")
         b2_cp(sha_path, f"pkgs/{arch_wish}/{wsh_name}.sha256")
         b2_cp(info_path, f"pkgs/{arch_wish}/{name}.info")
-
-        with open(index_path, "a") as f:
-            f.write(wsh_name + "\n")
-        b2_cp(index_path, f"index/{arch_wish}.txt")
-        return True
+        return wsh_name
     except Exception as e:
         print(f"FAILED {name_raw}={ver_raw}: {e}", file=sys.stderr)
-        return False
+        return None
     finally:
         if os.path.exists(deb_path):
             os.remove(deb_path)
         shutil.rmtree(extract_dir, ignore_errors=True)
 
 
+def merge_index(arch, own_index_path, state_dir):
+    """Union this shard's fresh index with a snapshot of every other shard's
+    (fetched from B2), then publish the result as the canonical
+    index/<arch>.txt that wish and the site actually read. Two shards
+    merging around the same moment can race and drop each other's latest
+    line -- harmless here, since the next periodic merge (by whichever shard
+    writes next) re-derives the union from scratch and self-heals it."""
+    lines = set()
+    if os.path.exists(own_index_path):
+        with open(own_index_path) as f:
+            lines.update(l.strip() for l in f if l.strip())
+    for s in range(NUM_SHARDS):
+        if s == SHARD:
+            continue
+        tmp = os.path.join(state_dir, f"other-{arch}-shard{s}.index")
+        if b2_get(f"index/{arch}/shard{s}.txt", tmp):
+            with open(tmp) as f:
+                lines.update(l.strip() for l in f if l.strip())
+    merged_path = os.path.join(state_dir, f"{arch}.merged.index")
+    with open(merged_path, "w") as f:
+        f.writelines(f"{l}\n" for l in sorted(lines))
+    b2_cp(merged_path, f"index/{arch}.txt")
+
+
 def mirror_arch(arch_wish, state_dir):
     cfg = ARCHES[arch_wish]
     base = cfg["base"]
-    print(f"=== arch: {arch_wish} (upstream: {cfg['deb_arch']}) ===", file=sys.stderr)
+    tag = f"shard{SHARD}" if NUM_SHARDS > 1 else None
+    label = f"{arch_wish} [{tag}]" if tag else arch_wish
+    print(f"=== arch: {label} (upstream: {cfg['deb_arch']}) ===", file=sys.stderr)
 
-    done_key, failed_key, index_key = (
-        f"state/{arch_wish}.done", f"state/{arch_wish}.failed", f"index/{arch_wish}.txt")
-    done_path = os.path.join(state_dir, f"{arch_wish}.done")
-    failed_path = os.path.join(state_dir, f"{arch_wish}.failed")
-    index_path = os.path.join(state_dir, f"{arch_wish}.index")
+    state_prefix = f"state/{arch_wish}/{tag}" if tag else f"state/{arch_wish}"
+    index_key = f"index/{arch_wish}/{tag}.txt" if tag else f"index/{arch_wish}.txt"
+    done_key, failed_key = f"{state_prefix}.done", f"{state_prefix}.failed"
+
+    done_path = os.path.join(state_dir, "done")
+    failed_path = os.path.join(state_dir, "failed")
+    index_path = os.path.join(state_dir, "index")
 
     done = load_state_set(done_key)
     failed = load_state_set(failed_key)
@@ -234,85 +283,66 @@ def mirror_arch(arch_wish, state_dir):
             name_raw, ver_raw = pkg.get("Package"), pkg.get("Version")
             if not name_raw or not ver_raw or name_raw in seen_names:
                 continue
+            if not in_shard(name_raw):
+                continue
             uid = f"{name_raw}={ver_raw}"
             if uid in done or uid in failed:
                 continue
             seen_names.add(name_raw)
             todo.append((uid, pkg))
 
-    print(f"{len(todo)} packages left for {arch_wish}", file=sys.stderr)
+    print(f"{len(todo)} packages left for {label}", file=sys.stderr)
 
     workdir = os.path.join(state_dir, "work")
     os.makedirs(workdir, exist_ok=True)
+
+    def flush():
+        b2_cp(done_path, done_key)
+        b2_cp(failed_path, failed_key)
+        b2_cp(index_path, index_key)
+        if NUM_SHARDS > 1:
+            merge_index(arch_wish, index_path, state_dir)
 
     processed = 0
     for uid, pkg in todo:
         if time.monotonic() > DEADLINE:
             print("deadline reached, stopping cleanly", file=sys.stderr)
             break
-        ok = process_package(arch_wish, base, pkg, workdir, index_path)
-        with open(done_path if ok else failed_path, "a") as f:
-            f.write(uid + "\n")
+        wsh_name = process_package(arch_wish, base, pkg, workdir)
+        if wsh_name:
+            with open(done_path, "a") as f:
+                f.write(uid + "\n")
+            with open(index_path, "a") as f:
+                f.write(wsh_name + "\n")
+        else:
+            with open(failed_path, "a") as f:
+                f.write(uid + "\n")
         processed += 1
         if processed % FLUSH_EVERY == 0:
-            b2_cp(done_path, done_key)
-            b2_cp(failed_path, failed_key)
+            flush()
             print(f"  ...{processed}/{len(todo)}", file=sys.stderr)
 
-    b2_cp(done_path, done_key)
-    b2_cp(failed_path, failed_key)
+    flush()
 
     remaining = len(todo) - processed
-    print(f"{arch_wish}: processed {processed}, remaining {remaining}", file=sys.stderr)
+    print(f"{label}: processed {processed}, remaining {remaining}", file=sys.stderr)
     return remaining
 
 
 def main():
+    if ARCH not in ARCHES:
+        print(f"Unknown MIRROR_ARCH={ARCH!r}", file=sys.stderr)
+        sys.exit(1)
+    if NUM_SHARDS > 1:
+        print(f"Shard {SHARD}/{NUM_SHARDS}, arch={ARCH}", file=sys.stderr)
+
     state_dir = tempfile.mkdtemp()
-    current_path = os.path.join(state_dir, "current-arch.txt")
-    current = ARCH_ORDER[0]
-    if b2_get("state/current-arch.txt", current_path):
-        val = open(current_path).read().strip()
-        if val in ARCH_ORDER:
-            current = val
-        elif val == "done":
-            print("ALL DONE (state marks completion)", file=sys.stderr)
-            _write_output(continue_=False)
-            return
+    remaining = mirror_arch(ARCH, state_dir)
 
-    start_idx = ARCH_ORDER.index(current)
-    for arch_wish in ARCH_ORDER[start_idx:]:
-        remaining = mirror_arch(arch_wish, state_dir)
-        if remaining > 0:
-            with open(current_path, "w") as f:
-                f.write(arch_wish)
-            b2_cp(current_path, "state/current-arch.txt")
-            _write_output(continue_=True, arch=arch_wish)
-            return
-        if time.monotonic() > DEADLINE:
-            # Ran out of time exactly between arches; resume at the next one.
-            next_idx = ARCH_ORDER.index(arch_wish) + 1
-            nxt = ARCH_ORDER[next_idx] if next_idx < len(ARCH_ORDER) else "done"
-            with open(current_path, "w") as f:
-                f.write(nxt)
-            b2_cp(current_path, "state/current-arch.txt")
-            _write_output(continue_=(nxt != "done"), arch=nxt)
-            return
-
-    with open(current_path, "w") as f:
-        f.write("done")
-    b2_cp(current_path, "state/current-arch.txt")
-    print("ALL DONE", file=sys.stderr)
-    _write_output(continue_=False)
-
-
-def _write_output(continue_, arch=""):
     out = os.environ.get("GITHUB_OUTPUT")
-    if not out:
-        return
-    with open(out, "a") as f:
-        f.write(f"continue={'true' if continue_ else 'false'}\n")
-        f.write(f"arch={arch}\n")
+    if out:
+        with open(out, "a") as f:
+            f.write(f"remaining={remaining}\n")
 
 
 if __name__ == "__main__":

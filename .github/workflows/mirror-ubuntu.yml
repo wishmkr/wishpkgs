@@ -3,14 +3,23 @@ name: Mirror upstream packages into wish (.wsh)
 # Repackages upstream precompiled binaries (main component only) into wish's
 # .wsh format for both wish archs, uploading each finished package to B2
 # immediately -- no waiting for the rest of the batch. Progress lives in B2
-# (state/<arch>.done, state/<arch>.failed, state/current-arch.txt) so this
-# picks up exactly where it left off, whether restarted manually or by itself.
+# (state/<arch>/shard<N>.done/.failed, state/current-arch.txt) so this picks
+# up exactly where it left off, whether restarted manually or by itself.
 #
-# GitHub Actions hard-kills any job at 6h. The Python script stops itself
-# cleanly at 5h30m (finishing whatever package it's mid-processing, never
-# mid-upload) and this workflow re-triggers itself to continue -- so the
-# whole mirror runs as an unattended chain of 5h30m sessions until nothing
-# is left for either arch.
+# Split into 4 parallel shards per arch (deterministic hash partition of the
+# package list -- see tools/mirror_ubuntu.py) so a full pass runs ~4x faster
+# than one worker churning through the whole list serially. Each shard keeps
+# its own done/failed state and its own index shard file (avoids concurrent
+# writers racing on one object); a small coordinate job merges all 4 shards'
+# results after they finish, decides whether the current arch is fully done
+# (and if so advances state/current-arch.txt to the next one), and re-queues
+# another run if any work remains anywhere.
+#
+# GitHub Actions hard-kills any job at 6h. Each shard stops itself cleanly at
+# ~5h25m (finishing whatever package it's mid-processing, never mid-upload),
+# leaving headroom for the coordinate job to run afterward -- so the whole
+# mirror runs as an unattended chain of ~5.5h sessions until nothing is left
+# for either arch.
 on:
   workflow_dispatch:
     inputs:
@@ -33,33 +42,131 @@ env:
   AWS_DEFAULT_REGION: eu-central-003
   MIRROR_RELEASE: noble
   MIRROR_COMPONENTS: main
-  MIRROR_DEADLINE_SECONDS: "19800" # 5h30m -- leaves headroom under the 6h job limit
+  MIRROR_DEADLINE_SECONDS: "19500" # ~5h25m, headroom for the coordinate job after
+  B2_HTTP: https://s3.eu-central-003.backblazeb2.com
 
 jobs:
-  mirror:
+  determine-arch:
     runs-on: ubuntu-24.04
-    timeout-minutes: 355 # hard safety net (5h55m); the script self-stops at 5h30m
+    timeout-minutes: 10
     outputs:
-      continue: ${{ steps.run.outputs.continue }}
+      arch: ${{ steps.get.outputs.arch }}
+      alldone: ${{ steps.get.outputs.alldone }}
     steps:
-      - uses: actions/checkout@v4
-
       - name: Reset progress state (optional)
         if: ${{ github.event.inputs.reset_state == 'true' }}
         run: |
-          B2="https://s3.eu-central-003.backblazeb2.com"
-          for f in state/x86_64.done state/x86_64.failed state/aarch64.done state/aarch64.failed state/current-arch.txt; do
-            aws s3 rm "s3://wishpkgs/$f" --endpoint-url "$B2" || true
+          set -eu
+          for arch in aarch64 x86_64; do
+            for shard in 0 1 2 3; do
+              aws s3 rm "s3://wishpkgs/state/$arch/shard$shard.done" --endpoint-url "$B2_HTTP" || true
+              aws s3 rm "s3://wishpkgs/state/$arch/shard$shard.failed" --endpoint-url "$B2_HTTP" || true
+              aws s3 rm "s3://wishpkgs/index/$arch/shard$shard.txt" --endpoint-url "$B2_HTTP" || true
+            done
+            aws s3 rm "s3://wishpkgs/index/$arch.txt" --endpoint-url "$B2_HTTP" || true
           done
+          aws s3 rm "s3://wishpkgs/state/current-arch.txt" --endpoint-url "$B2_HTTP" || true
+          echo "Progress reset."
 
-      - name: Mirror packages
+      - name: Determine current arch
+        id: get
+        run: |
+          set -eu
+          ARCH=$(curl -fsSL "$B2_HTTP/wishpkgs/state/current-arch.txt" 2>/dev/null | tr -d '[:space:]' || true)
+          [ -z "$ARCH" ] && ARCH="aarch64"
+          if [ "$ARCH" = "done" ]; then
+            echo "alldone=true" >> "$GITHUB_OUTPUT"
+            echo "arch=aarch64" >> "$GITHUB_OUTPUT"
+            echo "All architectures already fully mirrored."
+          else
+            echo "alldone=false" >> "$GITHUB_OUTPUT"
+            echo "arch=$ARCH" >> "$GITHUB_OUTPUT"
+            echo "Current arch: $ARCH"
+          fi
+
+  mirror:
+    needs: determine-arch
+    if: needs.determine-arch.outputs.alldone == 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355 # hard safety net (5h55m); the script self-stops at ~5h25m
+    env:
+      MIRROR_ARCH: ${{ needs.determine-arch.outputs.arch }}
+      MIRROR_SHARD: ${{ matrix.shard }}
+      MIRROR_SHARDS: "4"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mirror shard ${{ matrix.shard }} (${{ needs.determine-arch.outputs.arch }})
         id: run
         run: python3 tools/mirror_ubuntu.py
 
-      - name: Continue in a new run (deadline reached, work remains)
-        if: ${{ steps.run.outputs.continue == 'true' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Save shard status
+        if: always()
         run: |
-          echo "More packages left (next up: ${{ steps.run.outputs.arch }}) -- queuing another run."
-          gh workflow run mirror-ubuntu.yml --repo ${{ github.repository }}
+          mkdir -p status
+          echo '{"shard": ${{ matrix.shard }}, "remaining": ${{ steps.run.outputs.remaining || 999999 }}}' \
+            > status/shard-${{ matrix.shard }}.json
+          cat status/shard-${{ matrix.shard }}.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: shard-status-${{ matrix.shard }}
+          path: status/shard-${{ matrix.shard }}.json
+          retention-days: 1
+
+  coordinate:
+    needs: [determine-arch, mirror]
+    if: always() && needs.determine-arch.outputs.alldone == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: shard-status-*
+          path: status
+          merge-multiple: true
+
+      - name: Aggregate shards, advance arch if done, re-queue if work remains
+        run: |
+          set -eu
+          ARCH="${{ needs.determine-arch.outputs.arch }}"
+
+          # A missing status file means that shard's job never even reported in
+          # (e.g. it failed before the "always()" save step could run) -- treat
+          # as "unknown, assume work remains" so we never prematurely advance.
+          TOTAL=0
+          for shard in 0 1 2 3; do
+            f="status/shard-$shard.json"
+            if [ -f "$f" ]; then
+              R=$(jq -r '.remaining' "$f")
+            else
+              echo "::warning::shard $shard reported no status; assuming work remains"
+              R=999999
+            fi
+            echo "shard $shard remaining: $R"
+            TOTAL=$((TOTAL + R))
+          done
+          echo "Total remaining for $ARCH: $TOTAL"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            if [ "$ARCH" = "aarch64" ]; then NEXT="x86_64"; else NEXT="done"; fi
+            echo "$NEXT" > current-arch.txt
+            aws s3 cp current-arch.txt "s3://wishpkgs/state/current-arch.txt" \
+              --endpoint-url "$B2_HTTP" --no-progress
+            echo "$ARCH fully mirrored -> advanced current-arch.txt to $NEXT"
+          fi
+
+          FINAL=$(curl -fsSL "$B2_HTTP/wishpkgs/state/current-arch.txt" | tr -d '[:space:]')
+          if [ "$FINAL" != "done" ]; then
+            echo "Work remains -- queuing another run."
+            gh workflow run mirror-ubuntu.yml --repo ${{ github.repository }}
+          else
+            echo "All architectures fully mirrored. Not re-queuing."
+          fi
