@@ -1,0 +1,92 @@
+name: Clean up old B2 object versions
+
+# B2 keeps every overwritten object as a hidden "noncurrent" version instead
+# of deleting it, unless a lifecycle rule says otherwise. Re-processing
+# already-mirrored packages (e.g. right after the mirror pipeline switched to
+# sharded state keys) re-uploads the same filenames and silently doubles
+# their storage as old versions pile up. This sets a lifecycle rule so any
+# noncurrent version older than a day is auto-purged going forward, then
+# does one immediate pass to clear out whatever's already accumulated.
+on:
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      AWS_DEFAULT_REGION: eu-central-003
+      B2_HTTP: https://s3.eu-central-003.backblazeb2.com
+    steps:
+      - name: Set lifecycle rule (expire noncurrent versions after 1 day)
+        run: |
+          set -eu
+          cat > lifecycle.json <<'EOF'
+          {
+            "Rules": [
+              {
+                "ID": "expire-noncurrent-versions",
+                "Status": "Enabled",
+                "Filter": {},
+                "NoncurrentVersionExpiration": { "NoncurrentDays": 1 }
+              }
+            ]
+          }
+          EOF
+          aws s3api put-bucket-lifecycle-configuration \
+            --bucket wishpkgs --endpoint-url "$B2_HTTP" \
+            --lifecycle-configuration file://lifecycle.json
+          echo "Lifecycle rule set."
+
+      - name: Purge already-accumulated noncurrent versions now
+        run: |
+          set -eu
+          python3 - <<'PYEOF'
+          import json, subprocess, sys
+
+          BUCKET = "wishpkgs"
+          ENDPOINT = "https://s3.eu-central-003.backblazeb2.com"
+
+          def run(*args):
+              return subprocess.run(list(args), capture_output=True, text=True, check=True).stdout
+
+          to_delete = []
+          key_marker = None
+          version_id_marker = None
+          pages = 0
+          while True:
+              cmd = ["aws", "s3api", "list-object-versions", "--bucket", BUCKET,
+                     "--endpoint-url", ENDPOINT, "--output", "json", "--max-items", "1000"]
+              if key_marker:
+                  cmd += ["--key-marker", key_marker]
+              if version_id_marker:
+                  cmd += ["--version-id-marker", version_id_marker]
+              data = json.loads(run(*cmd))
+              for v in data.get("Versions", []) or []:
+                  if not v.get("IsLatest", False):
+                      to_delete.append({"Key": v["Key"], "VersionId": v["VersionId"]})
+              nkm = data.get("NextKeyMarker")
+              nvm = data.get("NextVersionIdMarker")
+              pages += 1
+              if not nkm and not nvm:
+                  break
+              key_marker, version_id_marker = nkm, nvm
+              if pages > 200:
+                  print("stopping pagination safety limit", file=sys.stderr)
+                  break
+
+          print(f"{len(to_delete)} noncurrent versions to delete")
+          for i in range(0, len(to_delete), 1000):
+              chunk = to_delete[i:i + 1000]
+              with open("delete-batch.json", "w") as f:
+                  json.dump({"Objects": chunk, "Quiet": True}, f)
+              subprocess.run(
+                  ["aws", "s3api", "delete-objects", "--bucket", BUCKET,
+                   "--endpoint-url", ENDPOINT, "--delete", "file://delete-batch.json"],
+                  check=True,
+              )
+              print(f"deleted batch {i // 1000 + 1} ({len(chunk)} versions)")
+          print("done")
+          PYEOF

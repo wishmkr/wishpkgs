@@ -231,14 +231,24 @@ def process_package(arch_wish, base, pkg, workdir):
 
 def merge_index(arch, own_index_path, state_dir):
     """Union this shard's fresh index with a snapshot of every other shard's
-    (fetched from B2), then publish the result as the canonical
-    index/<arch>.txt that wish and the site actually read. Two shards
-    merging around the same moment can race and drop each other's latest
-    line -- harmless here, since the next periodic merge (by whichever shard
-    writes next) re-derives the union from scratch and self-heals it."""
+    (fetched from B2) AND whatever the canonical index/<arch>.txt already
+    lists, then publish the result. Including the current canonical file
+    matters during the transition to a new NUM_SHARDS value (or right after
+    switching from unsharded state): without it, the merge would only ever
+    reflect what these specific shards have (re)confirmed so far, silently
+    hiding previously-published packages until every shard catches back up.
+    Two shards merging around the same moment can race and drop each other's
+    latest line -- harmless here, since the next periodic merge (by
+    whichever shard writes next) re-derives the union from scratch, and now
+    always includes the current canonical file too, so it self-heals and
+    never *shrinks*."""
     lines = set()
     if os.path.exists(own_index_path):
         with open(own_index_path) as f:
+            lines.update(l.strip() for l in f if l.strip())
+    current = os.path.join(state_dir, f"current-{arch}.index")
+    if b2_get(f"index/{arch}.txt", current):
+        with open(current) as f:
             lines.update(l.strip() for l in f if l.strip())
     for s in range(NUM_SHARDS):
         if s == SHARD:
