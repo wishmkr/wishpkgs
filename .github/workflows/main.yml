@@ -437,6 +437,19 @@ jobs:
           ls -la index/ 2>/dev/null || true
           ls -1 pkgs/*/*.info 2>/dev/null || true
 
+      - name: Upload to Backblaze B2 (wishpkgs.org)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+          AWS_DEFAULT_REGION: eu-central-003
+        run: |
+          set -eux
+          ENDPOINT="https://s3.eu-central-003.backblazeb2.com"
+          # B2 is the "main repo" that wish clients pull from via wishpkgs.org.
+          aws s3 sync pkgs/  "s3://wishpkgs/pkgs/"  --endpoint-url "$ENDPOINT" --no-progress
+          aws s3 sync index/ "s3://wishpkgs/index/" --endpoint-url "$ENDPOINT" --no-progress
+          echo "Uploaded packages + index to B2."
+
       - name: Commit packages to main
         run: |
           git config \
