@@ -1,7 +1,5 @@
-// lib.wishpkgs.org — package library for wish (WishOS package manager).
-//
-// Single self-contained Worker: Packages (live-refreshing search/table),
-// Releases (ISO downloads once published), Docs (wish CLI reference).
+// lib.wishpkgs.org — home (wiki-style guides + update notes), Packages
+// (live-refreshing search/table), Releases (ISO downloads once published).
 // The page's JS only ever talks to this same Worker (never directly to B2),
 // so there's no cross-origin fetch to worry about -- the Worker fetches B2
 // server-side and relays it.
@@ -13,7 +11,7 @@
 // cf.cacheTtl/cacheEverything toggles weren't reliably enough to stop a
 // stale response from a completely different Worker (cdn.wishpkgs.org, same
 // upstream URL, longer TTL) from being served here. Given the whole point
-// of this page is live data, guaranteed freshness beats a cache hit.
+// of the Packages tab is live data, guaranteed freshness beats a cache hit.
 const B2 = "https://s3.eu-central-003.backblazeb2.com/wishpkgs";
 
 function bust(url) {
@@ -55,20 +53,25 @@ const PAGE = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>wishpkgs — package library</title>
-<meta name="description" content="Browse packages, releases, and documentation for the wish package manager.">
+<title>wishpkgs — the wish package manager</title>
+<meta name="description" content="Guides, update notes, packages, and releases for wish, the WishOS package manager.">
 <style>
   :root {
     color-scheme: light dark;
     --bg: #fff; --fg: #1a1a1a; --muted: #6b7280; --line: #e5e7eb;
     --accent: #0f7a63; --row-hover: #f4faf8; --code-bg: #f4f5f7;
+    --tip-bg: #fff8ea; --tip-line: #e2b53f;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   @media (prefers-color-scheme: dark) {
-    :root { --bg: #14161a; --fg: #e8e8e8; --muted: #9aa1ab; --line: #2a2d33; --accent: #35c9a5; --row-hover: #1b2320; --code-bg: #1c1f24; }
+    :root {
+      --bg: #14161a; --fg: #e8e8e8; --muted: #9aa1ab; --line: #2a2d33;
+      --accent: #35c9a5; --row-hover: #1b2320; --code-bg: #1c1f24;
+      --tip-bg: #2a230f; --tip-line: #a5822c;
+    }
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
   header { display: flex; align-items: center; justify-content: space-between; padding: 16px 24px; border-bottom: 1px solid var(--line); flex-wrap: wrap; gap: 12px; }
   header .brand { font-weight: 700; font-size: 18px; letter-spacing: -0.02em; }
   header .brand .dot { color: var(--accent); }
@@ -82,6 +85,29 @@ const PAGE = `<!doctype html>
   main { max-width: 900px; margin: 0 auto; padding: 24px; }
   .view { display: none; }
   .view.active { display: block; }
+
+  /* ---- Home: intro + updates + guides (wiki-style) ---- */
+  .intro { margin-bottom: 32px; }
+  .intro h1 { font-size: 22px; margin: 0 0 8px; letter-spacing: -0.01em; }
+  .intro p { color: var(--muted); margin: 6px 0; max-width: 62ch; }
+  .home-grid { display: grid; grid-template-columns: 1fr; gap: 40px; }
+  section.block h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 700; margin: 0 0 16px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+  .update { border-bottom: 1px solid var(--line); padding: 14px 0; }
+  .update:last-child { border-bottom: 0; }
+  .update time { display: block; color: var(--muted); font-size: 12px; font-family: var(--mono); margin-bottom: 3px; }
+  .update h3 { margin: 0 0 5px; font-size: 15px; }
+  .update p { margin: 0; color: var(--muted); }
+
+  .guide h3 { font-size: 15px; margin: 26px 0 4px; }
+  .guide h3:first-child { margin-top: 0; }
+  .guide > p.lead { color: var(--muted); margin: 0 0 6px; }
+  .guide pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; overflow-x: auto; font-family: var(--mono); font-size: 13px; line-height: 1.65; margin: 8px 0 14px; }
+  .guide code { font-family: var(--mono); font-size: 13px; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; }
+  .callout { border-left: 3px solid var(--accent); background: var(--row-hover); padding: 8px 14px; border-radius: 0 6px 6px 0; margin: 10px 0 16px; font-size: 13.5px; color: var(--fg); }
+  .callout.tip { border-left-color: var(--tip-line); background: var(--tip-bg); }
+  .callout strong { text-transform: uppercase; font-size: 10.5px; letter-spacing: .05em; display: block; margin-bottom: 3px; color: var(--muted); }
+
+  /* ---- Packages ---- */
   .toolbar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
   .toolbar input { flex: 1; min-width: 200px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--fg); font-size: 14px; }
   .toolbar input:focus { outline: none; border-color: var(--accent); }
@@ -102,28 +128,26 @@ const PAGE = `<!doctype html>
   td.ver { font-family: var(--mono); color: var(--muted); white-space: nowrap; }
   td.desc { color: var(--muted); }
   td.desc.loading { font-style: italic; }
-  footer { text-align: center; color: var(--muted); font-size: 12px; padding: 32px 24px; }
-  footer a { color: var(--muted); }
   .empty { text-align: center; color: var(--muted); padding: 40px 0; }
+
+  /* ---- Releases ---- */
   .release-card { border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 12px; }
   .release-card h3 { margin: 0 0 4px; font-size: 15px; }
   .release-card .meta { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
   .release-card a.dl { display: inline-block; font-family: var(--mono); font-size: 13px; color: var(--accent); text-decoration: none; }
   .release-card a.dl:hover { text-decoration: underline; }
-  .docs h2 { font-size: 17px; margin: 32px 0 8px; }
-  .docs h2:first-child { margin-top: 0; }
-  .docs p { color: var(--muted); margin: 4px 0 10px; }
-  .docs pre { background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; overflow-x: auto; font-family: var(--mono); font-size: 13px; line-height: 1.6; }
-  .docs code { font-family: var(--mono); font-size: 13px; }
+
+  footer { text-align: center; color: var(--muted); font-size: 12px; padding: 32px 24px; }
+  footer a { color: var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <div class="brand">wish<span class="dot">pkgs</span></div>
   <div class="tabs">
-    <button data-view="packages" class="active">Packages</button>
+    <button data-view="home" class="active">Home</button>
+    <button data-view="packages">Packages</button>
     <button data-view="releases">Releases</button>
-    <button data-view="docs">Docs</button>
   </div>
   <div class="ext">
     <a href="https://wishpkgs.org">wishpkgs.org</a>
@@ -132,10 +156,108 @@ const PAGE = `<!doctype html>
 </header>
 <main>
 
-  <section id="view-packages" class="view active">
-    <div class="live"><span class="pulse"></span><span id="live-text">live — updated just now</span></div>
+  <section id="view-home" class="view active">
+    <div class="intro">
+      <h1>wish — the WishOS package manager</h1>
+      <p>A transactional, rollback-capable package manager with generations, Bedrock-style layers, and bidirectional bundling (system → package, not just the other way around).</p>
+      <p>This page covers what's changed recently and how to use it. See <b>Packages</b> for the live index, <b>Releases</b> for ISO images once published.</p>
+    </div>
+
+    <div class="home-grid">
+      <section class="block" id="updates">
+        <h2>Latest updates</h2>
+
+        <div class="update">
+          <time datetime="2026-07-20">2026-07-20</time>
+          <h3>Ubuntu package mirror underway (aarch64 first)</h3>
+          <p>A resumable pipeline now repackages upstream precompiled binaries (main component) into <code>.wsh</code> for both wish archs, uploading each finished package straight to the repo without waiting for the rest of the batch. aarch64 is being mirrored first; x86_64 follows once ready. Progress survives restarts, so this runs unattended across many sessions.</p>
+        </div>
+
+        <div class="update">
+          <time datetime="2026-07-20">2026-07-20</time>
+          <h3>Package library and CDN launched</h3>
+          <p>Packages now serve from <code>cdn.wishpkgs.org</code> (Backblaze B2 behind Cloudflare — free egress), and this site (<code>lib.wishpkgs.org</code>) went live as a browsable, live-refreshing package index.</p>
+        </div>
+
+        <div class="update">
+          <time datetime="2026-07-20">2026-07-20</time>
+          <h3>wish gains generations, rollback, bundling, services, layer federation</h3>
+          <p>Every install/remove now snapshots the full system (packages, plus managed config like <code>/etc</code>), and <code>wish rollback &lt;id&gt;</code> reverts all of it atomically. New: a service supervisor, Bedrock-style layers with OverlayFS/shares/snapshots, cross-layer command &amp; library federation, and two-way bundling — repackage an installed system back into a <code>.wsh</code>, not just install one.</p>
+        </div>
+      </section>
+
+      <section class="block guide" id="guides">
+        <h2>Guides</h2>
+
+        <h3>Getting started</h3>
+        <p class="lead">Install a package, then explore from there.</p>
+        <pre># wish init                 # first-time system setup (mounts, dirs, databases)
+# wish install &lt;pkg&gt;        # install with dependencies, transactional
+$ wish search &lt;query&gt;       # search the package index
+$ wish list                 # list installed packages
+$ wish info                 # show repo url, arch, cache/lib paths
+$ wish help                 # full command reference</pre>
+        <div class="callout"><strong>Note</strong>Commands that change system state (install, remove, upgrade, rollback, service control, entering a layer) require root. Read-only ones (search, list, graph, info) don't.</div>
+
+        <h3>Package management</h3>
+        <pre># wish install &lt;pkg&gt;        # wish -I &lt;pkg&gt;
+# wish remove &lt;pkg&gt;         # wish --remove &lt;pkg&gt;
+$ wish update                # wish --update
+# wish upgrade                # wish --upgrade
+$ wish pull &lt;pkg&gt;            # download to cache only, don't install
+$ wish graph &lt;pkg&gt;           # show dependency tree
+$ wish graph --history       # show transaction history</pre>
+
+        <h3>Generations &amp; rollback</h3>
+        <p class="lead">Every install/remove snapshots the full system state — packages and managed config together.</p>
+        <pre>$ wish generation list       # list generations (* = current)
+# wish generation create      # snapshot current state manually
+# wish rollback &lt;id&gt;          # atomically revert to a generation</pre>
+        <div class="callout tip"><strong>Tip</strong>Rollback restores three things together: the package database, the files those packages own, and any config path listed in <code>WISH_MANAGED_PATHS</code> (defaults to <code>/etc</code>).</div>
+
+        <h3>Bundling — system → package, not just package → system</h3>
+        <pre># wish bundle &lt;pkg&gt;           # repackage an installed pkg + its config/overrides
+# wish bundle --system        # snapshot the whole system into one .wsh
+# wish install &lt;file.wsh&gt;     # install from a local bundle file
+# wish restore &lt;file.wsh&gt;     # rehydrate a full system from a system bundle</pre>
+
+        <h3>Services</h3>
+        <pre># wish service define &lt;name&gt; &lt;cmd&gt; [--restart=&lt;policy&gt;] [--enable]
+# wish service start|stop|status|enable|disable &lt;name&gt;
+$ wish service list</pre>
+
+        <h3>Layers (Bedrock-style)</h3>
+        <p class="lead">Isolated filesystem roots sharing one kernel: chroot + a private mount namespace, with configurable shares, OverlayFS, and snapshots.</p>
+        <pre># wish layer add|remove &lt;name&gt;   $ wish layer list|info &lt;name&gt;
+# wish layer share &lt;name&gt; &lt;src&gt; [target] [--ro]
+# wish layer overlay &lt;name&gt; add &lt;lowerdir&gt; | off
+# wish layer clone &lt;src&gt; &lt;dst&gt;
+# wish layer snapshot &lt;name&gt; [snap-name]
+# wish layer gui &lt;name&gt; on|off        # share X11/Wayland/PipeWire/D-Bus
+# wish layer expose &lt;name&gt; &lt;binary&gt; [alias]   # global wrapper on host PATH
+# wish run &lt;layer&gt; &lt;cmd&gt; [args]</pre>
+
+        <h3>Federation</h3>
+        <pre># wish layer priority set &lt;l1&gt; &lt;l2&gt; ...
+# wish federate       # expose every layer's commands + libraries globally
+# wish defederate</pre>
+
+        <h3>Peer networking (LAN)</h3>
+        <pre># wish serve          # share cached packages with peers on port 44449
+$ wish peer scan      # scan the LAN for other wish peers</pre>
+
+        <h3>Environment variables</h3>
+        <pre>WISH_REPO_URL       WISH_CACHE_DIR      WISH_LIB_DIR
+WISH_ROOT           WISH_SERVICES_DIR   WISH_RUN_DIR
+WISH_WRAPPERS_DIR   WISH_MANAGED_PATHS</pre>
+      </section>
+    </div>
+  </section>
+
+  <section id="view-packages" class="view">
+    <div class="live"><span class="pulse"></span><span id="live-text">live — loading…</span></div>
     <div class="toolbar">
-      <input id="q" type="search" placeholder="Search packages…" autofocus>
+      <input id="q" type="search" placeholder="Search packages…">
       <div class="arch-tabs">
         <button data-arch="aarch64" class="active">aarch64</button>
         <button data-arch="x86_64">x86_64</button>
@@ -154,75 +276,13 @@ const PAGE = `<!doctype html>
     <div class="empty" id="releases-empty" hidden>No releases published yet — check back soon.</div>
   </section>
 
-  <section id="view-docs" class="view docs">
-    <h2>Getting started</h2>
-    <p>Install a package, then explore from there.</p>
-    <pre>wish init                 # first-time system setup (mounts, dirs, databases)
-wish install &lt;pkg&gt;        # install with dependencies, transactional
-wish search &lt;query&gt;       # search the package index
-wish list                 # list installed packages
-wish info                 # show repo url, arch, cache/lib paths
-wish help                 # full command reference</pre>
-
-    <h2>Package management</h2>
-    <pre>wish install &lt;pkg&gt;        wish -I &lt;pkg&gt;
-wish remove &lt;pkg&gt;         wish --remove &lt;pkg&gt;
-wish update                wish --update
-wish upgrade                wish --upgrade
-wish pull &lt;pkg&gt;            # download to cache only, don't install
-wish graph &lt;pkg&gt;           # show dependency tree
-wish graph --history       # show transaction history</pre>
-
-    <h2>Generations &amp; rollback</h2>
-    <p>Every install/remove snapshots the full system state (packages + managed config). Rolling back reverts all three.</p>
-    <pre>wish generation list        # list generations (* = current)
-wish generation create      # snapshot current state manually
-wish rollback &lt;id&gt;          # atomically revert to a generation</pre>
-
-    <h2>Bundling (system → package, not just package → system)</h2>
-    <pre>wish bundle &lt;pkg&gt;           # repackage an installed pkg + its config/overrides
-wish bundle --system         # snapshot the whole system into one .wsh
-wish install &lt;file.wsh&gt;     # install from a local bundle file
-wish restore &lt;file.wsh&gt;     # rehydrate a full system from a system bundle</pre>
-
-    <h2>Services</h2>
-    <pre>wish service define &lt;name&gt; &lt;cmd&gt; [--restart=&lt;policy&gt;] [--enable]
-wish service start|stop|status|enable|disable &lt;name&gt;
-wish service list</pre>
-
-    <h2>Layers (Bedrock-style)</h2>
-    <p>Isolated filesystem roots sharing one kernel: chroot + private mount namespace, with configurable shares, OverlayFS, and snapshots.</p>
-    <pre>wish layer add|remove|list|info &lt;name&gt;
-wish layer share &lt;name&gt; &lt;src&gt; [target] [--ro]
-wish layer overlay &lt;name&gt; add &lt;lowerdir&gt; | off
-wish layer clone &lt;src&gt; &lt;dst&gt;
-wish layer snapshot &lt;name&gt; [snap-name]
-wish layer gui &lt;name&gt; on|off        # share X11/Wayland/PipeWire/D-Bus
-wish layer expose &lt;name&gt; &lt;binary&gt; [alias]   # global wrapper on host PATH
-wish run &lt;layer&gt; &lt;cmd&gt; [args]</pre>
-
-    <h2>Federation</h2>
-    <pre>wish layer priority set &lt;l1&gt; &lt;l2&gt; ...
-wish federate       # expose every layer's commands + libraries globally
-wish defederate</pre>
-
-    <h2>Peer networking (LAN)</h2>
-    <pre>wish serve          # share cached packages with peers on port 44449
-wish peer scan      # scan the LAN for other wish peers</pre>
-
-    <h2>Environment variables</h2>
-    <pre>WISH_REPO_URL       WISH_CACHE_DIR      WISH_LIB_DIR
-WISH_ROOT           WISH_SERVICES_DIR   WISH_RUN_DIR
-WISH_WRAPPERS_DIR   WISH_MANAGED_PATHS</pre>
-  </section>
-
 </main>
 <footer>wishpkgs — packages for WishOS's <code>wish</code> package manager · <a href="https://wishpkgs.org">wishpkgs.org</a></footer>
 <script>
 (function () {
   const FILENAME_RE = /^([a-z0-9-]+)-([0-9.]+)-(\\d+)-([a-z0-9_]+)\\.wsh$/;
   const REFRESH_MS = 30000;
-  const state = { arch: "aarch64", rows: [] };
+  const state = { arch: "aarch64", rows: [], started: false };
   const q = document.getElementById("q");
   const body = document.getElementById("pkgbody");
   const count = document.getElementById("count");
@@ -314,10 +374,8 @@ WISH_WRAPPERS_DIR   WISH_MANAGED_PATHS</pre>
     });
   });
   q.addEventListener("input", render);
-  loadArch("aarch64");
-  setInterval(() => loadArch(state.arch, { silent: true }), REFRESH_MS);
 
-  // ---- view switching (Packages / Releases / Docs) ----
+  // ---- view switching (Home / Packages / Releases) ----
   const tabs = document.querySelectorAll("header .tabs button");
   const views = document.querySelectorAll(".view");
   tabs.forEach((b) => {
@@ -326,6 +384,11 @@ WISH_WRAPPERS_DIR   WISH_MANAGED_PATHS</pre>
       views.forEach((v) => v.classList.remove("active"));
       b.classList.add("active");
       document.getElementById("view-" + b.dataset.view).classList.add("active");
+      if (b.dataset.view === "packages" && !state.started) {
+        state.started = true;
+        loadArch("aarch64");
+        setInterval(() => loadArch(state.arch, { silent: true }), REFRESH_MS);
+      }
       if (b.dataset.view === "releases") loadReleases();
     });
   });
