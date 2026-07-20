@@ -42,7 +42,7 @@ ARCHES = {
     "x86_64":  {"deb_arch": "amd64", "base": "http://archive.ubuntu.com/ubuntu"},
     "aarch64": {"deb_arch": "arm64", "base": "http://ports.ubuntu.com/ubuntu-ports"},
 }
-ARCH_ORDER = ["x86_64", "aarch64"]
+ARCH_ORDER = ["aarch64", "x86_64"]
 
 B2_ENDPOINT = "https://s3.eu-central-003.backblazeb2.com"
 B2_BUCKET = "wishpkgs"
