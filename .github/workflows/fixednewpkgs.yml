@@ -133,6 +133,19 @@ jobs:
             llvm-dev \
             libclang-dev \
             xserver-xorg-dev \
+            libpixman-1-dev \
+            libepoxy-dev \
+            libfontenc-dev \
+            libfreetype-dev \
+            libbsd-dev \
+            libdbus-1-dev \
+            dbus-daemon \
+            xfonts-utils \
+            xfonts-encodings \
+            xfonts-scalable \
+            x11-xkb-utils \
+            libudev-dev \
+            libsystemd-dev \
             x11proto-dev
 
       - name: Create working directories
