@@ -1,0 +1,92 @@
+name: Fetch a single package out of queue order
+
+# For packages needed immediately (e.g. baking into a rootfs build) without
+# waiting for the sharded mirror to reach them in its normal pass. Reuses
+# tools/mirror_ubuntu.py's own sanitize/convert/upload logic so the result is
+# byte-identical to what the regular pipeline would have produced.
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: "Upstream package name (exact, e.g. iwd)"
+        type: string
+        required: true
+      component:
+        description: "Archive component"
+        type: string
+        default: "universe"
+      arch:
+        description: "wish arch"
+        type: choice
+        options: [aarch64, x86_64]
+        default: aarch64
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+  AWS_DEFAULT_REGION: eu-central-003
+  MIRROR_RELEASE: noble
+
+jobs:
+  fetch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch, convert, upload
+        run: |
+          python3 - <<PYEOF
+          import sys
+          sys.path.insert(0, "tools")
+          import mirror_ubuntu as m
+
+          arch_wish = "${{ inputs.arch }}"
+          component = "${{ inputs.component }}"
+          target_name = "${{ inputs.package }}".lower()
+          cfg = m.ARCHES[arch_wish]
+
+          text = m.fetch_packages_index(cfg["base"], m.RELEASE, component, cfg["deb_arch"])
+          match = None
+          for pkg in m.parse_packages(text):
+              if pkg.get("Package", "").lower() == target_name:
+                  match = pkg
+                  break
+          if not match:
+              print(f"Package {target_name!r} not found in {component}/{cfg['deb_arch']}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"Found: {match['Package']} {match['Version']}")
+          import tempfile, os
+          workdir = tempfile.mkdtemp()
+          wsh_name = m.process_package(arch_wish, cfg["base"], match, workdir)
+          if not wsh_name:
+              print("process_package failed", file=sys.stderr)
+              sys.exit(1)
+          print(f"Uploaded: pkgs/{arch_wish}/{wsh_name}")
+
+          # append to canonical + all shard index files so it shows up everywhere
+          import hashlib
+          shard = int(hashlib.md5(match["Package"].encode()).hexdigest(), 16) % 4
+          for key in [f"index/{arch_wish}.txt", f"index/{arch_wish}/shard{shard}.txt"]:
+              tmp = os.path.join(workdir, "idx")
+              m.b2_get(key, tmp)
+              lines = set()
+              if os.path.exists(tmp):
+                  with open(tmp) as f:
+                      lines.update(l.strip() for l in f if l.strip())
+              lines.add(wsh_name)
+              with open(tmp, "w") as f:
+                  f.writelines(f"{l}\n" for l in sorted(lines))
+              m.b2_cp(tmp, key)
+              print(f"updated {key}")
+
+          # mark done in that shard's state so the regular pipeline skips it later
+          uid = f"{match['Package']}={match['Version']}"
+          done_key = f"state/{arch_wish}/shard{shard}.done"
+          tmp = os.path.join(workdir, "done")
+          m.b2_get(done_key, tmp)
+          with open(tmp, "a") as f:
+              f.write(uid + "\n")
+          m.b2_cp(tmp, done_key)
+          print("done")
+          PYEOF
