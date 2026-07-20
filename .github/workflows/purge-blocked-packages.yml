@@ -1,0 +1,109 @@
+name: Purge blocked (distro-named) packages from B2
+
+# One-off cleanup companion to tools/mirror_ubuntu.py's BLOCKED_NAME_SUBSTRINGS
+# filter: removes any already-mirrored package whose name contains "debian",
+# "ubuntu", "apt", or "dpkg" (case-insensitive) -- the mirror script itself
+# now skips these going forward, but anything mirrored before that filter
+# existed needs a one-time sweep. Deletes the .wsh/.wsh.sha256/.info triplet
+# for each match and rewrites every index file (canonical + per-shard) to
+# drop those lines.
+on:
+  workflow_dispatch:
+
+jobs:
+  purge:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      AWS_DEFAULT_REGION: eu-central-003
+      B2_HTTP: https://s3.eu-central-003.backblazeb2.com
+    steps:
+      - name: List, delete matching objects, and rewrite index files
+        run: |
+          set -eu
+          python3 - <<'PYEOF'
+          import json, re, subprocess, sys
+
+          BUCKET = "wishpkgs"
+          ENDPOINT = "https://s3.eu-central-003.backblazeb2.com"
+          BLOCKED = ("debian", "ubuntu", "apt", "dpkg")
+          ARCHES = ("aarch64", "x86_64")
+
+          def run(*args, **kw):
+              return subprocess.run(list(args), capture_output=True, text=True, check=True, **kw).stdout
+
+          def is_blocked(text):
+              t = text.lower()
+              return any(b in t for b in BLOCKED)
+
+          # ---- 1) list every object under pkgs/, delete anything blocked ----
+          to_delete = []
+          token = None
+          pages = 0
+          while True:
+              cmd = ["aws", "s3api", "list-objects-v2", "--bucket", BUCKET,
+                     "--endpoint-url", ENDPOINT, "--prefix", "pkgs/",
+                     "--output", "json", "--max-items", "1000"]
+              if token:
+                  cmd += ["--starting-token", token]
+              data = json.loads(run(*cmd))
+              for obj in data.get("Contents", []) or []:
+                  key = obj["Key"]
+                  if is_blocked(key):
+                      to_delete.append({"Key": key})
+              token = (data.get("NextToken") or
+                       (data.get("NextContinuationToken")))
+              pages += 1
+              if not token or pages > 200:
+                  break
+
+          print(f"{len(to_delete)} objects to delete (name matches debian/ubuntu/apt/dpkg)")
+          for k in to_delete[:40]:
+              print(f"  {k['Key']}")
+          if len(to_delete) > 40:
+              print(f"  ...and {len(to_delete) - 40} more")
+
+          for i in range(0, len(to_delete), 1000):
+              chunk = to_delete[i:i + 1000]
+              with open("delete-batch.json", "w") as f:
+                  json.dump({"Objects": chunk, "Quiet": True}, f)
+              subprocess.run(
+                  ["aws", "s3api", "delete-objects", "--bucket", BUCKET,
+                   "--endpoint-url", ENDPOINT, "--delete", "file://delete-batch.json"],
+                  check=True,
+              )
+              print(f"deleted batch {i // 1000 + 1} ({len(chunk)} objects)")
+
+          # ---- 2) rewrite every index file to drop blocked lines ----
+          def rewrite_index(key):
+              r = subprocess.run(
+                  ["aws", "s3", "cp", f"s3://{BUCKET}/{key}", "-",
+                   "--endpoint-url", ENDPOINT, "--no-progress"],
+                  capture_output=True, text=True,
+              )
+              if r.returncode != 0:
+                  return 0, 0
+              lines = [l for l in r.stdout.splitlines() if l.strip()]
+              kept = [l for l in lines if not is_blocked(l)]
+              if len(kept) == len(lines):
+                  return len(lines), 0
+              with open("index-rewrite.txt", "w") as f:
+                  f.writelines(l + "\n" for l in kept)
+              subprocess.run(
+                  ["aws", "s3", "cp", "index-rewrite.txt", f"s3://{BUCKET}/{key}",
+                   "--endpoint-url", ENDPOINT, "--no-progress"],
+                  check=True,
+              )
+              return len(lines), len(lines) - len(kept)
+
+          for arch in ARCHES:
+              keys = [f"index/{arch}.txt"] + [f"index/{arch}/shard{s}.txt" for s in range(4)]
+              for key in keys:
+                  before, removed = rewrite_index(key)
+                  if before:
+                      print(f"{key}: {before} lines -> removed {removed}")
+
+          print("done")
+          PYEOF

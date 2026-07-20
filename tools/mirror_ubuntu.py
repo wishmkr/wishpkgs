@@ -68,6 +68,19 @@ def redact(text):
     return _REDACT_RE.sub("the system", text) if text else text
 
 
+BLOCKED_NAME_SUBSTRINGS = ("debian", "ubuntu", "apt", "dpkg")
+
+
+def is_blocked(name_raw):
+    """Packages whose upstream name itself names the distro or its own
+    packaging tools (apt, dpkg, ubuntu-*, debian-*) are excluded outright --
+    they're either meaningless without the Debian packaging stack we don't
+    ship (apt/dpkg need a live package database, sources.list, etc.) or they
+    just name-drop the distro directly."""
+    lower = name_raw.lower()
+    return any(s in lower for s in BLOCKED_NAME_SUBSTRINGS)
+
+
 def in_shard(name):
     """Stable partition: hashlib (not the built-in hash()) so the same
     package always maps to the same shard across separate processes/runs --
@@ -292,6 +305,8 @@ def mirror_arch(arch_wish, state_dir):
         for pkg in parse_packages(fetch_packages_index(base, RELEASE, comp, cfg["deb_arch"])):
             name_raw, ver_raw = pkg.get("Package"), pkg.get("Version")
             if not name_raw or not ver_raw or name_raw in seen_names:
+                continue
+            if is_blocked(name_raw):
                 continue
             if not in_shard(name_raw):
                 continue
