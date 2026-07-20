@@ -82,11 +82,26 @@ const PAGE = `<!doctype html>
   header .ext { display: flex; }
   header .ext a { color: var(--muted); text-decoration: none; font-size: 13px; margin-left: 16px; }
   header .ext a:hover { color: var(--fg); }
-  main { max-width: 900px; margin: 0 auto; padding: 24px; }
+  main { max-width: 1120px; margin: 0 auto; padding: 24px; }
   .view { display: none; }
   .view.active { display: block; }
 
-  /* ---- Home: intro + updates + guides (wiki-style) ---- */
+  /* ---- Home: intro + side nav + updates + guides (wiki-style) ---- */
+  html { scroll-behavior: smooth; }
+  .home-layout { display: grid; grid-template-columns: 200px 1fr; gap: 40px; align-items: start; }
+  .side-nav { position: sticky; top: 24px; max-height: calc(100vh - 48px); overflow-y: auto; border-right: 1px solid var(--line); padding-right: 16px; }
+  .side-nav .side-group { margin-bottom: 18px; }
+  .side-nav .side-group h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 6px; font-weight: 700; }
+  .side-nav a { display: block; color: var(--muted); text-decoration: none; font-size: 13px; padding: 3px 0; border-left: 2px solid transparent; padding-left: 8px; margin-left: -8px; }
+  .side-nav a:hover { color: var(--fg); }
+  .side-nav a.active { color: var(--accent); border-left-color: var(--accent); font-weight: 600; }
+  .home-main { min-width: 0; }
+  @media (max-width: 760px) {
+    .home-layout { grid-template-columns: 1fr; }
+    .side-nav { position: static; max-height: none; border-right: 0; padding-right: 0; border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 8px; }
+    .side-nav .side-group { display: inline-block; margin-right: 20px; vertical-align: top; }
+  }
+
   .intro { margin-bottom: 32px; }
   .intro h1 { font-size: 22px; margin: 0 0 8px; letter-spacing: -0.01em; }
   .intro p { color: var(--muted); margin: 6px 0; max-width: 62ch; }
@@ -157,10 +172,31 @@ const PAGE = `<!doctype html>
 <main>
 
   <section id="view-home" class="view active">
+    <div class="home-layout">
+      <nav class="side-nav" id="side-nav">
+        <div class="side-group">
+          <h4>Overview</h4>
+          <a href="#updates">Latest updates</a>
+        </div>
+        <div class="side-group">
+          <h4>Guides</h4>
+          <a href="#getting-started">Getting started</a>
+          <a href="#package-management">Package management</a>
+          <a href="#generations">Generations &amp; rollback</a>
+          <a href="#bundling">Bundling</a>
+          <a href="#services">Services</a>
+          <a href="#layers">Layers</a>
+          <a href="#federation">Federation</a>
+          <a href="#peer-networking">Peer networking</a>
+          <a href="#env-vars">Environment variables</a>
+        </div>
+      </nav>
+
+      <div class="home-main">
     <div class="intro">
       <h1>wish — the WishOS package manager</h1>
       <p>A transactional, rollback-capable package manager with generations, Bedrock-style layers, and bidirectional bundling (system → package, not just the other way around).</p>
-      <p>This page covers what's changed recently and how to use it. See <b>Packages</b> for the live index, <b>Releases</b> for ISO images once published.</p>
+      <p>This page covers what's changed recently and how to use it. Pick a topic on the left, or see <b>Packages</b> for the live index and <b>Releases</b> for ISO images once published.</p>
     </div>
 
     <div class="home-grid">
@@ -189,7 +225,7 @@ const PAGE = `<!doctype html>
       <section class="block guide" id="guides">
         <h2>Guides</h2>
 
-        <h3>Getting started</h3>
+        <h3 id="getting-started">Getting started</h3>
         <p class="lead">Install a package, then explore from there.</p>
         <pre># wish init                 # first-time system setup (mounts, dirs, databases)
 # wish install &lt;pkg&gt;        # install with dependencies, transactional
@@ -199,7 +235,7 @@ $ wish info                 # show repo url, arch, cache/lib paths
 $ wish help                 # full command reference</pre>
         <div class="callout"><strong>Note</strong>Commands that change system state (install, remove, upgrade, rollback, service control, entering a layer) require root. Read-only ones (search, list, graph, info) don't.</div>
 
-        <h3>Package management</h3>
+        <h3 id="package-management">Package management</h3>
         <pre># wish install &lt;pkg&gt;        # wish -I &lt;pkg&gt;
 # wish remove &lt;pkg&gt;         # wish --remove &lt;pkg&gt;
 $ wish update                # wish --update
@@ -208,25 +244,25 @@ $ wish pull &lt;pkg&gt;            # download to cache only, don't install
 $ wish graph &lt;pkg&gt;           # show dependency tree
 $ wish graph --history       # show transaction history</pre>
 
-        <h3>Generations &amp; rollback</h3>
+        <h3 id="generations">Generations &amp; rollback</h3>
         <p class="lead">Every install/remove snapshots the full system state — packages and managed config together.</p>
         <pre>$ wish generation list       # list generations (* = current)
 # wish generation create      # snapshot current state manually
 # wish rollback &lt;id&gt;          # atomically revert to a generation</pre>
         <div class="callout tip"><strong>Tip</strong>Rollback restores three things together: the package database, the files those packages own, and any config path listed in <code>WISH_MANAGED_PATHS</code> (defaults to <code>/etc</code>).</div>
 
-        <h3>Bundling — system → package, not just package → system</h3>
+        <h3 id="bundling">Bundling — system → package, not just package → system</h3>
         <pre># wish bundle &lt;pkg&gt;           # repackage an installed pkg + its config/overrides
 # wish bundle --system        # snapshot the whole system into one .wsh
 # wish install &lt;file.wsh&gt;     # install from a local bundle file
 # wish restore &lt;file.wsh&gt;     # rehydrate a full system from a system bundle</pre>
 
-        <h3>Services</h3>
+        <h3 id="services">Services</h3>
         <pre># wish service define &lt;name&gt; &lt;cmd&gt; [--restart=&lt;policy&gt;] [--enable]
 # wish service start|stop|status|enable|disable &lt;name&gt;
 $ wish service list</pre>
 
-        <h3>Layers (Bedrock-style)</h3>
+        <h3 id="layers">Layers (Bedrock-style)</h3>
         <p class="lead">Isolated filesystem roots sharing one kernel: chroot + a private mount namespace, with configurable shares, OverlayFS, and snapshots.</p>
         <pre># wish layer add|remove &lt;name&gt;   $ wish layer list|info &lt;name&gt;
 # wish layer share &lt;name&gt; &lt;src&gt; [target] [--ro]
@@ -237,20 +273,22 @@ $ wish service list</pre>
 # wish layer expose &lt;name&gt; &lt;binary&gt; [alias]   # global wrapper on host PATH
 # wish run &lt;layer&gt; &lt;cmd&gt; [args]</pre>
 
-        <h3>Federation</h3>
+        <h3 id="federation">Federation</h3>
         <pre># wish layer priority set &lt;l1&gt; &lt;l2&gt; ...
 # wish federate       # expose every layer's commands + libraries globally
 # wish defederate</pre>
 
-        <h3>Peer networking (LAN)</h3>
+        <h3 id="peer-networking">Peer networking (LAN)</h3>
         <pre># wish serve          # share cached packages with peers on port 44449
 $ wish peer scan      # scan the LAN for other wish peers</pre>
 
-        <h3>Environment variables</h3>
+        <h3 id="env-vars">Environment variables</h3>
         <pre>WISH_REPO_URL       WISH_CACHE_DIR      WISH_LIB_DIR
 WISH_ROOT           WISH_SERVICES_DIR   WISH_RUN_DIR
 WISH_WRAPPERS_DIR   WISH_MANAGED_PATHS</pre>
       </section>
+    </div>
+      </div>
     </div>
   </section>
 
@@ -392,6 +430,24 @@ WISH_WRAPPERS_DIR   WISH_MANAGED_PATHS</pre>
       if (b.dataset.view === "releases") loadReleases();
     });
   });
+
+  // ---- side-nav scrollspy: highlight whichever guide/update section is in view ----
+  const sideLinks = document.querySelectorAll(".side-nav a");
+  const sectioned = Array.from(sideLinks)
+    .map((a) => document.getElementById(a.getAttribute("href").slice(1)))
+    .filter(Boolean);
+  if (sectioned.length && "IntersectionObserver" in window) {
+    const spy = new IntersectionObserver(
+      (entries) => {
+        const visible = entries.filter((e) => e.isIntersecting);
+        if (!visible.length) return;
+        const topMost = visible.reduce((a, b) => (a.boundingClientRect.top < b.boundingClientRect.top ? a : b));
+        sideLinks.forEach((a) => a.classList.toggle("active", a.getAttribute("href") === "#" + topMost.target.id));
+      },
+      { rootMargin: "-10% 0px -70% 0px" }
+    );
+    sectioned.forEach((el) => spy.observe(el));
+  }
 
   // ---- releases (empty until an ISO is published to B2 releases/releases.json) ----
   let releasesLoaded = false;
