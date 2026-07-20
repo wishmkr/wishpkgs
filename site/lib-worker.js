@@ -5,6 +5,15 @@
 // The page's JS only ever talks to this same Worker (never directly to B2),
 // so there's no cross-origin fetch to worry about -- the Worker fetches B2
 // server-side and relays it.
+//
+// Deliberately uncached: Cloudflare's edge cache for a Worker's outbound
+// fetch() is keyed by the *upstream* URL, independent of which zone/Worker
+// requested it -- caching this here previously meant a stale response
+// cached by a totally different Worker (with a much longer TTL) kept being
+// served, and a same-zone purge_cache call can't reach it either, since
+// that cache key belongs to B2's hostname, not ours. Given the whole point
+// of this page is live data, a direct passthrough is both simplest and
+// actually correct.
 const B2 = "https://s3.eu-central-003.backblazeb2.com/wishpkgs";
 
 export default {
@@ -13,24 +22,23 @@ export default {
     const path = url.pathname;
 
     // GET /data/index/<arch>.txt -> proxy the plain package-filename list.
-    // Short cacheTtl so newly-mirrored packages show up quickly for pollers.
     let m = path.match(/^\/data\/index\/([a-z0-9_]+)\.txt$/);
     if (m) {
-      const resp = await fetch(`${B2}/index/${m[1]}.txt`, { cf: { cacheEverything: true, cacheTtl: 20 } });
+      const resp = await fetch(`${B2}/index/${m[1]}.txt`, { cf: { cacheTtl: 0 } });
       return new Response(resp.body, { status: resp.status, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
     // GET /data/info/<arch>/<name>.info -> proxy one package's metadata.
     m = path.match(/^\/data\/info\/([a-z0-9_]+)\/([a-z0-9-]+)\.info$/);
     if (m) {
-      const resp = await fetch(`${B2}/pkgs/${m[1]}/${m[2]}.info`, { cf: { cacheEverything: true, cacheTtl: 300 } });
+      const resp = await fetch(`${B2}/pkgs/${m[1]}/${m[2]}.info`, { cf: { cacheTtl: 0 } });
       return new Response(resp.body, { status: resp.status, headers: { "content-type": "text/plain; charset=utf-8" } });
     }
 
     // GET /data/releases.json -> proxy the release manifest (doesn't exist
     // yet; the page treats any non-200 here as "no releases published").
     if (path === "/data/releases.json") {
-      const resp = await fetch(`${B2}/releases/releases.json`, { cf: { cacheEverything: true, cacheTtl: 60 } });
+      const resp = await fetch(`${B2}/releases/releases.json`, { cf: { cacheTtl: 0 } });
       return new Response(resp.body, { status: resp.status, headers: { "content-type": "application/json; charset=utf-8" } });
     }
 
