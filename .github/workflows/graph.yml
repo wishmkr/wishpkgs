@@ -610,8 +610,10 @@ jobs:
                 || tar -xzOf "$wsh" WISH/info > "$archdir$name.info" 2>/dev/null \
                 || echo "warning: no WISH/info in $base"
             done
-            mkdir -p index
-            ( cd "$archdir" && ls -1 *.wsh 2>/dev/null ) > "index/$arch.txt"
+            if ls "$archdir"*.wsh >/dev/null 2>&1; then
+              mkdir -p index
+              ( cd "$archdir" && ls -1 *.wsh ) > "index/$arch.txt"
+            fi
           done
 
       - name: Commit packages to main
