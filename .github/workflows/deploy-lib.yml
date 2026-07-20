@@ -1,0 +1,79 @@
+name: Deploy lib.wishpkgs.org (package library) + wishpkgs.com redirect
+
+# One-shot setup (re-runnable): deploys the package-library Worker to
+# lib.wishpkgs.org, and a tiny redirect Worker sending wishpkgs.com (+www)
+# to it. Mirrors the same Cloudflare-API deploy pattern as deploy-cdn.yml.
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy library site -> lib.wishpkgs.org
+        run: |
+          set -euo pipefail
+          API=https://api.cloudflare.com/client/v4
+          auth=(-H "Authorization: Bearer $CF_API_TOKEN")
+          ZONE=wishpkgs.org
+          HOST=lib.wishpkgs.org
+          WORKER=wishpkgs-lib
+
+          ZONE_JSON=$(curl -s "${auth[@]}" "$API/zones?name=$ZONE")
+          ZONE_ID=$(echo "$ZONE_JSON" | jq -r '.result[0].id')
+          ACCT_ID=$(echo "$ZONE_JSON" | jq -r '.result[0].account.id')
+          echo "zone($ZONE)=$ZONE_ID account=$ACCT_ID"
+          test "$ZONE_ID" != "null" -a -n "$ZONE_ID"
+
+          UP=$(curl -s -X PUT "${auth[@]}" \
+            "$API/accounts/$ACCT_ID/workers/scripts/$WORKER" \
+            -F "metadata={\"main_module\":\"lib-worker.js\"};type=application/json" \
+            -F "lib-worker.js=@site/lib-worker.js;type=application/javascript+module")
+          echo "$UP" | jq -r '{success, errors}'
+          test "$(echo "$UP" | jq -r '.success')" = "true"
+
+          DOM=$(curl -s -X PUT "${auth[@]}" \
+            "$API/accounts/$ACCT_ID/workers/domains" \
+            -H "Content-Type: application/json" \
+            -d "{\"zone_id\":\"$ZONE_ID\",\"hostname\":\"$HOST\",\"service\":\"$WORKER\",\"environment\":\"production\"}")
+          echo "$DOM" | jq -r '{success, errors, result}'
+          echo "== Test: https://$HOST/ =="
+
+      - name: Deploy redirect -> wishpkgs.com (+www) to lib.wishpkgs.org
+        run: |
+          set -euo pipefail
+          API=https://api.cloudflare.com/client/v4
+          auth=(-H "Authorization: Bearer $CF_API_TOKEN")
+          ZONE=wishpkgs.com
+          WORKER=wishpkgs-redirect
+
+          ZONE_JSON=$(curl -s "${auth[@]}" "$API/zones?name=$ZONE")
+          ZONE_ID=$(echo "$ZONE_JSON" | jq -r '.result[0].id // empty')
+          if [ -z "$ZONE_ID" ]; then
+            echo "::warning::Zone $ZONE not visible to this token (or not yet on this Cloudflare account)."
+            echo "If wishpkgs.com is owned but this fails, widen CF_API_TOKEN's Zone Resources to include it, then re-run this workflow."
+            exit 0
+          fi
+          ACCT_ID=$(echo "$ZONE_JSON" | jq -r '.result[0].account.id')
+          echo "zone($ZONE)=$ZONE_ID account=$ACCT_ID"
+
+          UP=$(curl -s -X PUT "${auth[@]}" \
+            "$API/accounts/$ACCT_ID/workers/scripts/$WORKER" \
+            -F "metadata={\"main_module\":\"redirect-worker.js\"};type=application/json" \
+            -F "redirect-worker.js=@site/redirect-worker.js;type=application/javascript+module")
+          echo "$UP" | jq -r '{success, errors}'
+          test "$(echo "$UP" | jq -r '.success')" = "true"
+
+          for HOST in wishpkgs.com www.wishpkgs.com; do
+            DOM=$(curl -s -X PUT "${auth[@]}" \
+              "$API/accounts/$ACCT_ID/workers/domains" \
+              -H "Content-Type: application/json" \
+              -d "{\"zone_id\":\"$ZONE_ID\",\"hostname\":\"$HOST\",\"service\":\"$WORKER\",\"environment\":\"production\"}")
+            echo "$HOST ->"; echo "$DOM" | jq -r '{success, errors}'
+          done
+          echo "== Test: https://wishpkgs.com/ (should 301 -> lib.wishpkgs.org) =="
