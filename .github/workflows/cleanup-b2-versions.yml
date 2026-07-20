@@ -78,6 +78,23 @@ jobs:
                   break
 
           print(f"{len(to_delete)} noncurrent versions to delete")
+
+          from collections import Counter
+          def bucket(key):
+              if key.startswith("pkgs/"): return "pkgs/ (actual packages)"
+              if key.startswith("index/"): return "index/ (rewritten every ~20 pkgs)"
+              if key.startswith("state/"): return "state/ (rewritten every ~20 pkgs)"
+              return "other"
+          counts = Counter(bucket(d["Key"]) for d in to_delete)
+          for k, v in counts.most_common():
+              print(f"  {v:6d}  {k}")
+          pkg_keys = sorted({d["Key"] for d in to_delete if d["Key"].startswith("pkgs/")})
+          print(f"\n{len(pkg_keys)} distinct package-file keys still had an old version:")
+          for k in pkg_keys[:30]:
+              print(f"  {k}")
+          if len(pkg_keys) > 30:
+              print(f"  ...and {len(pkg_keys) - 30} more")
+
           for i in range(0, len(to_delete), 1000):
               chunk = to_delete[i:i + 1000]
               with open("delete-batch.json", "w") as f:
