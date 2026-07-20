@@ -31,19 +31,24 @@ jobs:
 
           echo "== Write Worker script =="
           cat > worker.js <<'JS'
-          // Deliberately uncached: a Worker's outbound fetch() cache key is the
-          // *upstream* URL, independent of which zone/Worker requested it, so a
-          // long cacheTtl here previously kept serving a stale index to every
-          // wish client and to lib.wishpkgs.org (same upstream URL, different
-          // Worker) long after B2 had moved on -- and a same-zone purge_cache
-          // can't reach it, since that cache key belongs to B2's hostname, not
-          // ours. wish clients and the package browser both need live data, so
-          // a direct passthrough is simplest and actually correct.
+          // Deliberately uncached, with a brute-force guarantee: every upstream
+          // fetch carries a unique cache-busting query param, so it can never
+          // collide with a previously-cached copy of that URL under any
+          // caching layer. A Worker's outbound fetch() cache key is the
+          // *upstream* URL, independent of which zone/Worker requested it --
+          // a long cacheTtl here previously kept serving a stale index to
+          // every wish client and to lib.wishpkgs.org (same upstream URL,
+          // different Worker) long after B2 had moved on, and same-zone
+          // purge_cache couldn't reach it either (that cache key belongs to
+          // B2's hostname, not ours). wish clients and the package browser
+          // both need live data, so guaranteed freshness beats a cache hit.
           export default {
             async fetch(request) {
               const B2 = "https://s3.eu-central-003.backblazeb2.com/wishpkgs";
               const url = new URL(request.url);
-              const resp = await fetch(B2 + url.pathname, { cf: { cacheTtl: 0 } });
+              const cb = "cb=" + Date.now() + Math.random().toString(36).slice(2);
+              const target = B2 + url.pathname + (url.search ? url.search + "&" + cb : "?" + cb);
+              const resp = await fetch(target, { cf: { cacheTtl: 0 } });
               return new Response(resp.body, { status: resp.status, headers: resp.headers });
             }
           }
