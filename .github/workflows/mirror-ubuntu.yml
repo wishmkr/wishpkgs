@@ -1,0 +1,65 @@
+name: Mirror upstream packages into wish (.wsh)
+
+# Repackages upstream precompiled binaries (main component only) into wish's
+# .wsh format for both wish archs, uploading each finished package to B2
+# immediately -- no waiting for the rest of the batch. Progress lives in B2
+# (state/<arch>.done, state/<arch>.failed, state/current-arch.txt) so this
+# picks up exactly where it left off, whether restarted manually or by itself.
+#
+# GitHub Actions hard-kills any job at 6h. The Python script stops itself
+# cleanly at 5h30m (finishing whatever package it's mid-processing, never
+# mid-upload) and this workflow re-triggers itself to continue -- so the
+# whole mirror runs as an unattended chain of 5h30m sessions until nothing
+# is left for either arch.
+on:
+  workflow_dispatch:
+    inputs:
+      reset_state:
+        description: "Wipe all progress and start over from scratch"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: mirror-ubuntu
+  cancel-in-progress: false
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+  AWS_DEFAULT_REGION: eu-central-003
+  MIRROR_RELEASE: noble
+  MIRROR_COMPONENTS: main
+  MIRROR_DEADLINE_SECONDS: "19800" # 5h30m -- leaves headroom under the 6h job limit
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355 # hard safety net (5h55m); the script self-stops at 5h30m
+    outputs:
+      continue: ${{ steps.run.outputs.continue }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reset progress state (optional)
+        if: ${{ github.event.inputs.reset_state == 'true' }}
+        run: |
+          B2="https://s3.eu-central-003.backblazeb2.com"
+          for f in state/x86_64.done state/x86_64.failed state/aarch64.done state/aarch64.failed state/current-arch.txt; do
+            aws s3 rm "s3://wishpkgs/$f" --endpoint-url "$B2" || true
+          done
+
+      - name: Mirror packages
+        id: run
+        run: python3 tools/mirror_ubuntu.py
+
+      - name: Continue in a new run (deadline reached, work remains)
+        if: ${{ steps.run.outputs.continue == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "More packages left (next up: ${{ steps.run.outputs.arch }}) -- queuing another run."
+          gh workflow run mirror-ubuntu.yml --repo ${{ github.repository }}
