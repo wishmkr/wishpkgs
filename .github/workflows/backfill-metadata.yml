@@ -1,0 +1,55 @@
+name: Backfill package metadata (.info + provides index)
+
+# Regenerates .info (depends/conflicts/breaks/provides/description) and the
+# shared provides index for packages ALREADY mirrored, straight from
+# upstream Packages/primary.xml files -- no payload re-download, no .wsh
+# re-upload. See tools/backfill_metadata.py's module docstring for why this
+# exists: sanitize_name() had a real multiarch-qualifier bug (fixed
+# 2026-07-22) that left stale/wrong dependency metadata on every package
+# mirrored before the fix, even though their .wsh payloads are completely
+# fine and don't need touching.
+#
+# Much cheaper than a full re-mirror (no curl/dpkg-deb/tar per package, just
+# parsing the already-fetched Packages text and re-uploading a small .info
+# file), so a modest shard count covers both arches quickly.
+on:
+  workflow_dispatch:
+    inputs:
+      distros:
+        description: "Comma-separated distros to backfill"
+        type: string
+        default: "ubuntu,debian,fedora"
+
+permissions:
+  contents: read
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+  AWS_DEFAULT_REGION: eu-central-003
+  B2_HTTP: https://s3.eu-central-003.backblazeb2.com
+  BACKFILL_DISTROS: ${{ github.event.inputs.distros }}
+  BACKFILL_SHARDS: "8"
+  BACKFILL_DEADLINE_SECONDS: "19500"
+  BACKFILL_COMPONENTS_UBUNTU: "main,universe,multiverse,restricted"
+  BACKFILL_COMPONENTS_DEBIAN: "main,contrib,non-free-firmware"
+
+jobs:
+  backfill:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, x86_64]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      MIRROR_ARCH: ${{ matrix.arch }}
+      BACKFILL_SHARD: ${{ matrix.shard }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rpm/cpio (needed to import mirror_fedora.py)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rpm cpio zstd
+      - name: Backfill metadata
+        working-directory: tools
+        run: python3 backfill_metadata.py

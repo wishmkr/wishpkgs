@@ -81,14 +81,20 @@ def write_info(workdir, name, description, license_line, depends, provides, conf
     return info_path
 
 
-def backfill_deb(distro_mod, distro_name, arch_wish, canonical, workdir):
+def backfill_deb(distro_mod, distro_name, arch_wish, canonical, workdir, components):
     """Shared logic for mirror_ubuntu / mirror_debian, whose Packages-file
-    stanza shape and .info fields are identical."""
+    stanza shape and .info fields are identical. `components` is passed in
+    explicitly rather than read from distro_mod.COMPONENTS -- both mirror
+    modules are imported into this ONE process and read the shared
+    MIRROR_COMPONENTS env var at import time, so there's no way to give
+    Ubuntu and Debian their own component lists (they don't even share
+    component names -- "universe" isn't a Debian thing) through that
+    module-global alone."""
     cfg = distro_mod.ARCHES[arch_wish]
     base = cfg["base"]
     rewritten, provides_pairs = 0, []
 
-    for comp in distro_mod.COMPONENTS:
+    for comp in components:
         if deadline_hit():
             break
         try:
@@ -200,9 +206,13 @@ def main():
         if deadline_hit():
             break
         if distro == "ubuntu":
-            n, p = backfill_deb(mirror_ubuntu, "ubuntu", ARCH, canonical, workdir)
+            comps = [c for c in os.environ.get(
+                "BACKFILL_COMPONENTS_UBUNTU", "main").split(",") if c]
+            n, p = backfill_deb(mirror_ubuntu, "ubuntu", ARCH, canonical, workdir, comps)
         elif distro == "debian":
-            n, p = backfill_deb(mirror_debian, "debian", ARCH, canonical, workdir)
+            comps = [c for c in os.environ.get(
+                "BACKFILL_COMPONENTS_DEBIAN", "main").split(",") if c]
+            n, p = backfill_deb(mirror_debian, "debian", ARCH, canonical, workdir, comps)
         elif distro == "fedora":
             n, p = backfill_fedora(ARCH, canonical, workdir)
         else:
