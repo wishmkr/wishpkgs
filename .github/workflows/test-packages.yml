@@ -1,19 +1,27 @@
-name: Test every mirrored package (resolve + download + extract)
+name: Test, heal, and re-verify the package catalog
 
-# Read-only pass over the live catalog (both archs): for every package,
-# walks its full dependency closure exactly like wish's own resolver does,
-# then downloads + checksum-verifies + extract-checks every package in that
-# closure. Catches things `wish install <pkg>` would only surface at
-# install time -- a missing dependency (wish's resolver only *warns* on
-# "Package not found" and continues, so a broken dependency chain currently
-# fails silently), a checksum mismatch, or a corrupt archive.
+# Three-phase, self-healing pass over the live catalog:
 #
-# Talks only to the public CDN (cdn.wishpkgs.org) -- no B2 credentials
-# needed, nothing here can modify the catalog. 20 shards per arch,
-# partitioned by tools/test_packages.py the same way the mirror scripts
-# shard their work. Each shard uploads its own JSON report; the aggregate
-# job merges everything into one report and writes a human-readable summary
-# to the run's summary page.
+#  1. test-phase1 (10 shards/arch): walks every package's full dependency
+#     closure exactly like wish's own resolver, downloading + checksum-
+#     verifying + extract-checking everything. Anything with no .info at
+#     all anywhere in a closure is collected as a "missing name".
+#  2. heal (1 job/arch): for every missing name, tries to actually mirror it
+#     in for real -- checks Ubuntu (main/universe/multiverse/restricted),
+#     then Debian (main/contrib/non-free-firmware), then Fedora
+#     (Everything), in that order, and republishes index/<arch>.txt with
+#     whatever it found. This is the ONLY step that writes to B2 -- needs
+#     the same B2 credentials the mirror workflows use.
+#  3. test-phase2 (10 shards/arch): re-checks ONLY the names heal.py just
+#     tried to fix (not the whole catalog again) to see whether the fix
+#     actually landed. Anything still broken here is a real problem (most
+#     often a Debian/Ubuntu "virtual" package name like dpkg-dev or
+#     perl-any that was never a real installable package to begin with,
+#     not a mirroring gap) and goes straight into the final report for a
+#     human to look at -- nothing here guesses or auto-fixes further.
+#
+# test-phase1/2 are read-only against the public CDN (no secrets needed);
+# only the heal job touches B2.
 on:
   workflow_dispatch:
     inputs:
@@ -27,14 +35,17 @@ permissions:
 
 env:
   WISH_CDN: https://cdn.wishpkgs.org
-  TEST_SHARDS: "20"
   TEST_DEADLINE_SECONDS: "19500"
+  HEAL_DEADLINE_SECONDS: "19500"
+  AWS_DEFAULT_REGION: eu-central-003
 
 jobs:
   plan:
     runs-on: ubuntu-24.04
     outputs:
-      matrix: ${{ steps.gen.outputs.matrix }}
+      matrix1: ${{ steps.gen.outputs.matrix1 }}
+      matrix2: ${{ steps.gen.outputs.matrix2 }}
+      archs: ${{ steps.gen.outputs.archs }}
     steps:
       - id: gen
         run: |
@@ -43,110 +54,238 @@ jobs:
           python3 - "$ARCHS" <<'PY' >> "$GITHUB_OUTPUT"
           import json, sys
           archs = [a.strip() for a in sys.argv[1].split(",") if a.strip()]
-          combos = [{"arch": a, "shard": s} for a in archs for s in range(20)]
-          print("matrix=" + json.dumps({"include": combos}))
+          combos = [{"arch": a, "shard": s} for a in archs for s in range(10)]
+          print("matrix1=" + json.dumps({"include": combos}))
+          print("matrix2=" + json.dumps({"include": combos}))
+          print("archs=" + json.dumps(archs))
           PY
 
-  test:
+  # ---- phase 1: discover ----
+  test-phase1:
     needs: plan
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.plan.outputs.matrix1) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
       TEST_ARCH: ${{ matrix.arch }}
       TEST_SHARD: ${{ matrix.shard }}
-      TEST_OUTPUT_DIR: results
+      TEST_SHARDS: "10"
+      TEST_OUTPUT_DIR: results1
     steps:
       - uses: actions/checkout@v4
+      - run: python3 tools/test_packages.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: phase1-${{ matrix.arch }}-shard${{ matrix.shard }}
+          path: results1/*.json
+          retention-days: 7
 
-      - name: Test shard ${{ matrix.shard }} (${{ matrix.arch }})
-        id: run
+  # ---- collect: distinct missing names per arch ----
+  collect-missing:
+    needs: [plan, test-phase1]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      any_missing: ${{ steps.collect.outputs.any_missing }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: phase1-*
+          path: results1
+          merge-multiple: true
+
+      - id: collect
+        run: |
+          python3 - <<'PY'
+          import glob, json, os
+
+          by_arch = {}
+          for path in glob.glob("results1/results-*-shard*.json"):
+              with open(path) as f:
+                  d = json.load(f)
+              by_arch.setdefault(d["arch"], set()).update(d.get("missing_names", []))
+
+          any_missing = False
+          for arch, names in by_arch.items():
+              if names:
+                  any_missing = True
+              with open(f"missing-names-{arch}.txt", "w") as f:
+                  f.writelines(f"{n}\n" for n in sorted(names))
+              print(f"{arch}: {len(names)} distinct missing names")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"any_missing={'true' if any_missing else 'false'}\n")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: missing-names
+          path: missing-names-*.txt
+          retention-days: 7
+
+  # ---- phase 2a: heal (writes to B2 -- only job in this workflow that does) ----
+  heal:
+    needs: [plan, collect-missing]
+    if: needs.collect-missing.outputs.any_missing == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ${{ fromJson(needs.plan.outputs.archs) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      HEAL_ARCH: ${{ matrix.arch }}
+      HEAL_OUTPUT_DIR: heal-results
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: missing-names
+          path: missing-names
+
+      - name: Heal missing names for ${{ matrix.arch }}
+        run: |
+          set -eu
+          f="missing-names/missing-names-${{ matrix.arch }}.txt"
+          if [ -s "$f" ]; then
+            python3 tools/heal_missing.py "$f"
+          else
+            echo "nothing missing for ${{ matrix.arch }}"
+            mkdir -p heal-results
+            echo '{}' > heal-results/heal-report-${{ matrix.arch }}.json
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: heal-${{ matrix.arch }}
+          path: heal-results/*.json
+          retention-days: 14
+
+  # ---- phase 2b: re-verify exactly what heal tried to fix ----
+  test-phase2:
+    needs: [plan, heal]
+    if: always() && needs.heal.result != 'skipped'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.matrix2) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: missing-names
+          path: missing-names
+
+      - name: Split names for this shard
+        run: |
+          python3 - <<PY
+          import hashlib
+          arch, shard, num_shards = "${{ matrix.arch }}", ${{ matrix.shard }}, 10
+          with open(f"missing-names/missing-names-{arch}.txt") as f:
+              names = [l.strip() for l in f if l.strip()]
+          mine = [n for n in names
+                  if int(hashlib.md5(n.encode()).hexdigest(), 16) % num_shards == shard]
+          with open("my-names.txt", "w") as f:
+              f.writelines(f"{n}\n" for n in mine)
+          print(f"{len(mine)}/{len(names)} names assigned to this shard")
+          PY
+
+      - name: Re-verify
+        env:
+          TEST_ARCH: ${{ matrix.arch }}
+          TEST_SHARD: ${{ matrix.shard }}
+          TEST_SHARDS: "10"
+          TEST_NAMES_FILE: my-names.txt
+          TEST_OUTPUT_DIR: results2
         run: python3 tools/test_packages.py
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: results-${{ matrix.arch }}-shard${{ matrix.shard }}
-          path: results/*.json
-          retention-days: 14
+          name: phase2-${{ matrix.arch }}-shard${{ matrix.shard }}
+          path: results2/*.json
+          retention-days: 30
 
-  aggregate:
-    needs: test
+  # ---- final report: whatever's still broken after healing + re-verify ----
+  final-report:
+    needs: [test-phase2, heal]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: results-*
-          path: results
+          pattern: phase2-*
+          path: results2
           merge-multiple: true
+        continue-on-error: true
 
-      - name: Merge shard reports into one summary
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: heal-*
+          path: heal
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Build final report
         run: |
           python3 - <<'PY'
-          import glob, json, collections
+          import glob, json
 
-          all_results = {}
-          per_arch_totals = collections.Counter()
-          per_arch_failed = collections.Counter()
-          reason_counts = collections.Counter()
+          heal_reports = {}
+          for path in glob.glob("heal/heal-report-*.json"):
+              with open(path) as f:
+                  heal_reports.update(json.load(f))
 
-          for path in glob.glob("results/results-*-shard*.json"):
+          still_failing = {}
+          totals = {}
+          for path in glob.glob("results2/results-*-shard*.json"):
               with open(path) as f:
                   d = json.load(f)
               arch = d["arch"]
-              per_arch_totals[arch] += d["tested"]
-              per_arch_failed[arch] += d["failed_count"]
+              totals[arch] = totals.get(arch, 0) + d["tested"]
               for name, outcome in d["results"].items():
-                  all_results.setdefault(arch, {})[name] = outcome
                   if outcome != "ok":
-                      reason = outcome.split(":", 1)[0]
-                      reason_counts[reason] += 1
+                      still_failing[name] = outcome
 
-          with open("merged-report.json", "w") as f:
-              json.dump(all_results, f, indent=2, sort_keys=True)
+          lines = ["# Final report: heal + re-verify\n\n"]
+          lines.append(f"Names heal.py attempted: {len(heal_reports)}\n")
+          healed_ok = sum(1 for v in heal_reports.values() if v.get("status") == "healed")
+          lines.append(f"  - actually mirrored in: {healed_ok}\n")
+          lines.append(f"  - not found anywhere (ubuntu/debian/fedora): "
+                        f"{len(heal_reports) - healed_ok}\n\n")
+          lines.append(f"Re-verified: {sum(totals.values())} names\n")
+          lines.append(f"Still failing after heal: {len(still_failing)}\n\n")
 
-          # Full, untruncated list of every failure + its reason -- the
-          # summary.md below only shows the first 50 per arch, this has all
-          # of them, one per line, grep-able.
-          with open("failures.log", "w") as f:
-              for arch, pkgs in sorted(all_results.items()):
-                  for name, outcome in sorted(pkgs.items()):
-                      if outcome != "ok":
-                          f.write(f"{arch}\t{name}\t{outcome}\n")
-
-          lines = ["# Package test report\n"]
-          for arch in sorted(per_arch_totals):
-              t, fcount = per_arch_totals[arch], per_arch_failed[arch]
-              pct = (100 * fcount / t) if t else 0
-              lines.append(f"**{arch}**: {t} tested, {fcount} failed ({pct:.1f}%)\n")
-          lines.append("\n## Failure reasons\n")
-          for reason, count in reason_counts.most_common():
-              lines.append(f"- `{reason}`: {count}\n")
-          lines.append("\n## First 50 failing packages per arch\n")
-          for arch, pkgs in all_results.items():
-              failing = [(n, o) for n, o in sorted(pkgs.items()) if o != "ok"]
-              lines.append(f"\n### {arch} ({len(failing)} failing)\n")
-              for name, outcome in failing[:50]:
-                  lines.append(f"- `{name}`: {outcome}\n")
+          lines.append("## Still failing (needs a human look)\n")
+          for name, outcome in sorted(still_failing.items()):
+              source = heal_reports.get(name, {})
+              status = source.get("status", "?")
+              lines.append(f"- `{name}`: {outcome} (heal status: {status})\n")
 
           summary = "".join(lines)
-          with open("summary.md", "w") as f:
+          with open("final-summary.md", "w") as f:
               f.write(summary)
+          with open("final-still-failing.json", "w") as f:
+              json.dump(still_failing, f, indent=2, sort_keys=True)
           print(summary)
           PY
 
       - name: Write to job summary
-        run: cat summary.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat final-summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: merged-package-test-report
+          name: final-report
           path: |
-            merged-report.json
-            summary.md
-            failures.log
-          retention-days: 30
+            final-summary.md
+            final-still-failing.json
+          retention-days: 60

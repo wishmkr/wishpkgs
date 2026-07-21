@@ -55,6 +55,14 @@ def http_get(url, binary=False):
 
 
 def fetch_index(arch):
+    # TEST_NAMES_FILE restricts the run to a specific set of packages (phase
+    # 2 of the test-and-heal pipeline: re-verify only what phase 1 flagged
+    # and heal_missing.py tried to fix, instead of re-scanning everything).
+    names_file = os.environ.get("TEST_NAMES_FILE")
+    if names_file:
+        with open(names_file) as f:
+            return [l.strip() for l in f if l.strip()]
+
     text = http_get(f"{CDN}/index/{arch}.txt")
     names = []
     pattern = re.compile(r"^(?P<name>.+)-[0-9][0-9.]*-\d+-(?:x86_64|aarch64)\.wsh$")
@@ -205,13 +213,21 @@ def main():
     failed = {k: v for k, v in results.items() if v != "ok"}
     print(f"shard {SHARD}: tested {tested}, failed {len(failed)}", file=sys.stderr)
 
+    # Every name anywhere in the dependency graphs we walked (not just the
+    # top-level packages in `names`) that came back with no .info at all --
+    # this is the actual set heal_missing.py needs, since a top-level
+    # package's failure is usually caused by some dependency several levels
+    # down, not the top-level name itself.
+    missing_names = sorted(n for n, outcome in _CHECKED.items() if outcome == "missing_info")
+
     out_dir = os.environ.get("TEST_OUTPUT_DIR", ".")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"results-{ARCH}-shard{SHARD}.json")
     with open(out_path, "w") as f:
         json.dump({
             "arch": ARCH, "shard": SHARD, "tested": tested,
-            "failed_count": len(failed), "results": results,
+            "failed_count": len(failed), "missing_names": missing_names,
+            "results": results,
         }, f, indent=2, sort_keys=True)
     print(f"wrote {out_path}", file=sys.stderr)
 
