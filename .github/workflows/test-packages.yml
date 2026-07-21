@@ -109,6 +109,15 @@ jobs:
           with open("merged-report.json", "w") as f:
               json.dump(all_results, f, indent=2, sort_keys=True)
 
+          # Full, untruncated list of every failure + its reason -- the
+          # summary.md below only shows the first 50 per arch, this has all
+          # of them, one per line, grep-able.
+          with open("failures.log", "w") as f:
+              for arch, pkgs in sorted(all_results.items()):
+                  for name, outcome in sorted(pkgs.items()):
+                      if outcome != "ok":
+                          f.write(f"{arch}\t{name}\t{outcome}\n")
+
           lines = ["# Package test report\n"]
           for arch in sorted(per_arch_totals):
               t, fcount = per_arch_totals[arch], per_arch_failed[arch]
@@ -139,4 +148,5 @@ jobs:
           path: |
             merged-report.json
             summary.md
+            failures.log
           retention-days: 30
