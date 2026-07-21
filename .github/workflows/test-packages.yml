@@ -436,9 +436,93 @@ jobs:
           path: results-verify3/*.json
           retention-days: 30
 
-  # ==== final summary-log: every name tested across all 4 rounds, ok AND failing ====
+  # ==== final-verify: re-check the ORIGINAL top-level failures, not just the
+  # raw missing-name leaves ====
+  # verify-round1/2/3 only ever re-test the specific missing dependency
+  # NAMES heal tried to fix (e.g. "oss-compat") -- never the top-level
+  # packages that depended on them (e.g. "aumix-common"). A top-level
+  # package can never be *broken* by healing (healing only ever adds
+  # packages, never removes or changes existing ones), so re-testing
+  # exactly phase1's own original failure list -- once, after all 3 heal
+  # rounds are done -- gives the true final pass/fail count for the whole
+  # catalog at a fraction of the cost of rescanning everything (this list
+  # is usually a third or less of the full catalog).
+  collect-final-targets:
+    needs: [plan, test-phase1, heal-round3]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-phase1-shard*
+          path: results-phase1
+          merge-multiple: true
+      - run: |
+          python3 - <<'PY'
+          import glob, json
+          by_arch = {}
+          for path in glob.glob("results-phase1/results-*-shard*.json"):
+              with open(path) as f:
+                  d = json.load(f)
+              arch = d["arch"]
+              failing = {n for n, o in d["results"].items() if o != "ok"}
+              by_arch.setdefault(arch, set()).update(failing)
+          for arch, names in by_arch.items():
+              with open(f"final-targets-{arch}.txt", "w") as f:
+                  f.writelines(f"{n}\n" for n in sorted(names))
+              print(f"{arch}: {len(names)} originally-failing top-level packages to re-check")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: final-targets
+          path: final-targets-*.txt
+          retention-days: 7
+
+  final-verify:
+    needs: [plan, collect-final-targets]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.shards) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: final-targets
+          path: final-targets
+      - name: Re-verify shard ${{ matrix.shard }} against original failures
+        run: |
+          set -eu
+          for arch in $(echo '${{ needs.plan.outputs.archs }}' | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
+            f="final-targets/final-targets-$arch.txt"
+            [ -f "$f" ] || { echo "no targets file for $arch"; continue; }
+            python3 - "$arch" ${{ matrix.shard }} <<'PY'
+          import hashlib, sys
+          arch, shard, num_shards = sys.argv[1], int(sys.argv[2]), 20
+          with open(f"final-targets/final-targets-{arch}.txt") as f:
+              names = [l.strip() for l in f if l.strip()]
+          mine = [n for n in names
+                  if int(hashlib.md5(n.encode()).hexdigest(), 16) % num_shards == shard]
+          with open("my-names.txt", "w") as f:
+              f.writelines(f"{n}\n" for n in mine)
+          print(f"{arch}: {len(mine)}/{len(names)} names assigned to this shard")
+          PY
+            TEST_ARCH="$arch" TEST_SHARD="${{ matrix.shard }}" TEST_SHARDS="20" \
+              TEST_NAMES_FILE=my-names.txt TEST_OUTPUT_DIR=results-final \
+              python3 tools/test_packages.py
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-final-shard${{ matrix.shard }}
+          path: results-final/*.json
+          retention-days: 30
+
+  # ==== final summary-log ====
   summary-log:
-    needs: [verify-round3]
+    needs: [verify-round3, final-verify]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -473,6 +557,12 @@ jobs:
         continue-on-error: true
       - uses: actions/download-artifact@v4
         with:
+          pattern: results-final-shard*
+          path: all-results/final
+          merge-multiple: true
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
           pattern: heal-round1-shard*
           path: all-heal/round1
           merge-multiple: true
@@ -500,33 +590,60 @@ jobs:
               with open(path) as f:
                   heal_reports.update(json.load(f))
 
-          # Latest-known status per (arch, name) across every round -- a
-          # later round's result for the same name supersedes an earlier
-          # one, since it reflects the state after more healing. Each round
-          # was downloaded into its own subdirectory (see the download steps
-          # above) specifically so same-named shard files from different
-          # rounds don't clobber each other on disk before we get here.
-          latest = {}
-          for round_dir in ("phase1", "verify1", "verify2", "verify3"):
+          # The TRUE final status per top-level (arch, package): start from
+          # phase1's own result for every package in the catalog, then
+          # overlay final-verify's result wherever it re-checked one (only
+          # the packages phase1 originally reported failing -- see
+          # collect-final-targets). Healing only ever ADDS packages, so a
+          # package phase1 already reported "ok" cannot have been broken by
+          # it and never needed re-checking; final-verify's result for a
+          # previously-failing package is the accurate post-heal answer,
+          # which is what most people mean by "is the catalog actually
+          # healthy now" -- not verify-round1/2/3 below, which only ever
+          # re-tested the raw missing dependency NAMES heal tried to fix
+          # (e.g. "oss-compat"), never the top-level packages that had
+          # depended on them (e.g. "aumix-common").
+          final_status = {}
+          for path in glob.glob("all-results/phase1/results-*-shard*.json"):
+              with open(path) as f:
+                  d = json.load(f)
+              arch = d["arch"]
+              for name, outcome in d["results"].items():
+                  final_status[(arch, name)] = outcome
+          for path in glob.glob("all-results/final/results-*-shard*.json"):
+              with open(path) as f:
+                  d = json.load(f)
+              arch = d["arch"]
+              for name, outcome in d["results"].items():
+                  final_status[(arch, name)] = outcome
+
+          ok_count = sum(1 for v in final_status.values() if v == "ok")
+          fail_count = len(final_status) - ok_count
+
+          with open("full-results.log", "w") as f:
+              for (arch, name), outcome in sorted(final_status.items()):
+                  status = "DONE" if outcome == "ok" else "FAIL"
+                  f.write(f"{status}\t{arch}\t{name}\t{outcome}\n")
+
+          # Secondary detail: how far the raw missing-dependency-NAME level
+          # got across the 3 heal/verify rounds (not the same thing as the
+          # top-level numbers above -- kept for transparency into what heal
+          # actually did).
+          leaf_latest = {}
+          for round_dir in ("verify1", "verify2", "verify3"):
               for path in glob.glob(f"all-results/{round_dir}/results-*-shard*.json"):
                   with open(path) as f:
                       d = json.load(f)
                   arch = d["arch"]
                   for name, outcome in d["results"].items():
-                      latest[(arch, name)] = outcome
-
-          ok_count = sum(1 for v in latest.values() if v == "ok")
-          fail_count = len(latest) - ok_count
-
-          with open("full-results.log", "w") as f:
-              for (arch, name), outcome in sorted(latest.items()):
-                  status = "DONE" if outcome == "ok" else "FAIL"
-                  f.write(f"{status}\t{arch}\t{name}\t{outcome}\n")
+                      leaf_latest[(arch, name)] = outcome
+          leaf_ok = sum(1 for v in leaf_latest.values() if v == "ok")
 
           lines = ["# 3-round heal + verify: final summary\n\n"]
-          lines.append(f"Total distinct (arch, package) checked across all rounds: {len(latest)}\n")
-          lines.append(f"  - DONE (ok): {ok_count}\n")
-          lines.append(f"  - FAIL: {fail_count}\n\n")
+          lines.append("## Top-level catalog health (the real answer)\n")
+          lines.append(f"Total distinct (arch, package) in the catalog: {len(final_status)}\n")
+          lines.append(f"  - DONE (installable): {ok_count}\n")
+          lines.append(f"  - FAIL (still broken): {fail_count}\n\n")
 
           lines.append("## Heal totals (all 3 rounds combined)\n")
           healed_ok = sum(1 for v in heal_reports.values() if v.get("status") == "healed")
@@ -534,8 +651,13 @@ jobs:
           lines.append(f"- actually mirrored in: {healed_ok}\n")
           lines.append(f"- not found anywhere (ubuntu/debian/fedora): {len(heal_reports) - healed_ok}\n\n")
 
-          lines.append("## Still failing after round 3 (first 100)\n")
-          still_failing = [(a, n, o) for (a, n), o in sorted(latest.items()) if o != "ok"]
+          lines.append("## Raw missing-name level detail (not the same as the top-level count above)\n")
+          lines.append(f"- distinct missing names re-verified: {len(leaf_latest)}\n")
+          lines.append(f"- now resolvable: {leaf_ok}\n")
+          lines.append(f"- still unresolvable: {len(leaf_latest) - leaf_ok}\n\n")
+
+          lines.append("## Still failing after healing (first 100 top-level packages)\n")
+          still_failing = [(a, n, o) for (a, n), o in sorted(final_status.items()) if o != "ok"]
           for arch, name, outcome in still_failing[:100]:
               lines.append(f"- `{arch}/{name}`: {outcome}\n")
 
