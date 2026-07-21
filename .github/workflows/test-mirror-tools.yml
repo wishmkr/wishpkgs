@@ -1,0 +1,23 @@
+name: Test mirror pipeline tooling
+
+# Runs tools/test_mirror_regressions.py -- fast, offline, credential-free unit
+# tests covering the multiarch-qualifier sanitization bug, the arch:all /
+# is_blocked() distinction, and test_packages.py's provides-aware missing_info
+# classification (see that file's module docstring for the full history).
+# No B2 credentials needed since these tests never touch the network or B2.
+on:
+  push:
+    paths:
+      - "tools/**.py"
+  pull_request:
+    paths:
+      - "tools/**.py"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest test_mirror_regressions -v
+        working-directory: tools

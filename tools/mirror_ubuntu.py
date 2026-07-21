@@ -320,9 +320,8 @@ def mirror_arch(arch_wish, state_dir):
     if not b2_get(index_key, index_path):
         open(index_path, "w").close()
 
-    todo, seen_names = [], set()
-    for comp in COMPONENTS:
-        for pkg in parse_packages(fetch_packages_index(base, RELEASE, comp, cfg["deb_arch"])):
+    def collect(text):
+        for pkg in parse_packages(text):
             name_raw, ver_raw = pkg.get("Package"), pkg.get("Version")
             if not name_raw or not ver_raw or name_raw in seen_names:
                 continue
@@ -335,6 +334,18 @@ def mirror_arch(arch_wish, state_dir):
                 continue
             seen_names.add(name_raw)
             todo.append((uid, pkg))
+
+    # NOTE: "Architecture: all" packages need no special handling here --
+    # unlike e.g. an RPM-style repo layout, Debian/Ubuntu's binary-<arch>
+    # Packages.gz ALREADY inlines every arch:all package for that arch
+    # (confirmed directly against archive.ubuntu.com: ubuntu-mono, adduser,
+    # adwaita-icon-theme etc. all appear in binary-amd64/Packages.gz with
+    # "Architecture: all"). There is no separate binary-all index to fetch.
+    # A package like "ubuntu-mono" missing from the catalog is NOT this --
+    # it's is_blocked() correctly doing its job (name contains "ubuntu").
+    todo, seen_names = [], set()
+    for comp in COMPONENTS:
+        collect(fetch_packages_index(base, RELEASE, comp, cfg["deb_arch"]))
 
     print(f"{len(todo)} packages left for {label}", file=sys.stderr)
 

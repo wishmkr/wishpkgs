@@ -36,8 +36,65 @@ NUM_SHARDS = max(1, int(os.environ.get("TEST_SHARDS", "1")))
 DEADLINE = time.monotonic() + float(os.environ.get("TEST_DEADLINE_SECONDS", "19500"))
 TIMEOUT = 30
 
-_INFO_CACHE = {}   # name -> parsed .info dict (depends/description/license), or None if 404
+_INFO_CACHE = {}    # name -> parsed .info dict (depends/description/license), or None if 404
 _CHECKED = {}       # name -> "ok" | reason string, memoized so a shared dep is only fetched once
+_PROVIDES_CACHE = {}  # arch -> {virtual_name: [real_name, ...]}
+
+
+def _parse_depends_field(value):
+    """Parses wish's own .info wire format for a depends=/conflicts=/
+    breaks= line: comma-separated independent dependency slots, '|'
+    separates OR-alternatives within one slot, "name (OPversion)" carries
+    an optional version constraint this script doesn't need to evaluate
+    (it only checks resolvability, not version satisfaction -- that's the
+    C++ resolver's job). Returns a list of OR-groups, each a list of
+    alternative names -- mirrors DepSpec::parse's shape. Previously this
+    was naively `value.split(",")`, which for ANY constrained or
+    OR-alternative dependency produced a garbage literal like
+    "foo (>=1.2)|bar" and looked it up as one nonexistent package name --
+    a real bug independent of, but compounding, the virtual-provides gap."""
+    groups = []
+    for slot in value.split(","):
+        slot = slot.strip()
+        if not slot:
+            continue
+        alts = []
+        for alt in slot.split("|"):
+            alt = alt.strip()
+            if not alt:
+                continue
+            name = alt.split("(", 1)[0].strip()
+            if name:
+                alts.append(name)
+        if alts:
+            groups.append(alts)
+    return groups
+
+
+def load_provides_index(arch):
+    """Fetches index/<arch>-provides.txt (published by the mirror scripts'
+    Provides extraction) exactly once per arch per run -- the same file
+    wish's own RemoteIndex::get_providers() reads, so a name that has no
+    .info of its own but IS a known virtual/ABI name (e.g.
+    "qtbase-abi-5-15-8") can be resolved through whichever real package
+    provides it instead of being misreported as missing."""
+    if arch in _PROVIDES_CACHE:
+        return _PROVIDES_CACHE[arch]
+    idx = {}
+    try:
+        text = http_get(f"{CDN}/index/{arch}-provides.txt")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                virtual, real = parts
+                idx.setdefault(virtual, []).append(real)
+    except Exception as e:
+        print(f"warning: could not load provides index for {arch}: {e}", file=sys.stderr)
+    _PROVIDES_CACHE[arch] = idx
+    return idx
 
 
 def in_shard(name):
@@ -88,10 +145,10 @@ def fetch_info(arch, name):
         _INFO_CACHE[name] = None
         return None
 
-    depends = []
+    depends = []  # list of OR-groups, each a list of alternative names
     for line in text.splitlines():
         if line.startswith("depends="):
-            depends = [d.strip() for d in line[len("depends="):].split(",") if d.strip()]
+            depends = _parse_depends_field(line[len("depends="):])
     info = {"depends": depends}
     _INFO_CACHE[name] = info
     return info
@@ -116,6 +173,20 @@ def find_wsh_filename(arch, name):
     return None
 
 
+def check_dep_group(arch, alt_names, chain):
+    """One comma-separated dependency slot, possibly with '|' alternatives
+    (e.g. "foo|bar"): satisfied if ANY alternative resolves ok, mirroring
+    wish's own resolve_dep_spec fallback-through-alternatives behavior.
+    Reports the last-tried alternative's failure reason if none succeed."""
+    last_reason = "?"
+    for alt in alt_names:
+        r = check_package(arch, alt, chain)
+        if r == "ok":
+            return "ok"
+        last_reason = f"{alt}={r}"
+    return last_reason
+
+
 def check_package(arch, name, chain):
     """Recursively resolves + verifies `name` and its dependency closure.
     `chain` is the current DFS ancestry, used to break cycles exactly like
@@ -130,14 +201,40 @@ def check_package(arch, name, chain):
 
     info = fetch_info(arch, name)
     if info is None:
+        # No literal .info -- before declaring this missing, check whether
+        # `name` is actually a known virtual/ABI name (e.g.
+        # "qtbase-abi-5-15-8") satisfied by some real package's Provides.
+        # Checking literal-name-first, provides-second matches wish's own
+        # resolver order (DependencyResolver::resolve_dep_spec: direct name
+        # match always shadows a same-named Provides entry). A name that
+        # genuinely isn't anywhere -- not a real package, not in the
+        # provides index either -- is still "missing_info" and still goes
+        # to heal_missing.py to try mirroring in for real.
+        providers = load_provides_index(arch).get(name)
+        if providers:
+            for provider in providers:
+                if check_package(arch, provider, chain) == "ok":
+                    _CHECKED[name] = "ok"
+                    return "ok"
+            # Every provider is broken/missing -- but `name` itself is a
+            # virtual name, not a real package, so it must NOT be added to
+            # missing_names (heal_missing.py would try to mirror-in a
+            # package literally called "qtbase-abi-5-15-8", which upstream
+            # simply does not have -- that's the exact bug being fixed
+            # here). The real provider package(s) already recorded their
+            # own failure reason under their own name via the recursive
+            # check_package call above, which IS heal-actionable.
+            result = "virtual_unsatisfied:" + ",".join(providers)
+            _CHECKED[name] = result
+            return result
         result = "missing_info"
         _CHECKED[name] = result
         return result
 
-    for dep in info["depends"]:
-        dep_result = check_package(arch, dep, chain)
-        if dep_result != "ok":
-            result = f"dep_failed:{dep}={dep_result}"
+    for group in info["depends"]:
+        group_result = check_dep_group(arch, group, chain)
+        if group_result != "ok":
+            result = f"dep_failed:{group_result}"
             _CHECKED[name] = result
             return result
 

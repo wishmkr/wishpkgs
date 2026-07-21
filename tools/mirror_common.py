@@ -102,7 +102,25 @@ def load_state_set(key):
 # only [a-z0-9][a-z0-9-]*; RemoteIndex's index-line regex requires the
 # version group to be [0-9.]+ and release to be \d+) ----
 
+
+# Debian relationship fields (Depends/Pre-Depends/Recommends/Provides/
+# Conflicts/Breaks/...) can suffix a package name with a multiarch
+# qualifier: ":any" (satisfied by any architecture's build), ":native"
+# (build-architecture specific), or a literal architecture name (e.g.
+# ":armhf"). None of that concept exists in wish's single-arch-per-catalog
+# model. MUST be stripped before sanitize_name ever sees the name -- its
+# [^a-z0-9-] cleanup below turns ':' into '-', so "python3:any" silently
+# became the nonexistent "python3-any" (a real bug: this made every
+# multiarch-qualified dependency unresolvable).
+_MULTIARCH_QUALIFIER_RE = re.compile(r":(any|native|[a-z0-9][a-z0-9-]*)$")
+
+
+def strip_multiarch_qualifier(name):
+    return _MULTIARCH_QUALIFIER_RE.sub("", name)
+
+
 def sanitize_name(raw):
+    raw = strip_multiarch_qualifier(raw)
     n = raw.lower().replace("+", "plus").replace(".", "-")
     n = re.sub(r"[^a-z0-9-]", "-", n)
     n = re.sub(r"-{2,}", "-", n).strip("-")

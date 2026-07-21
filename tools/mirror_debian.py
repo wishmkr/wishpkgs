@@ -174,9 +174,8 @@ def mirror_arch(arch_wish, state_dir):
     # re-added.
     existing_names = load_canonical_names(arch_wish, state_dir)
 
-    todo, seen_names = [], set()
-    for comp in COMPONENTS:
-        for pkg in parse_packages(fetch_packages_index(base, RELEASE, comp, cfg["deb_arch"])):
+    def collect(text):
+        for pkg in parse_packages(text):
             name_raw, ver_raw = pkg.get("Package"), pkg.get("Version")
             if not name_raw or not ver_raw or name_raw in seen_names:
                 continue
@@ -192,6 +191,14 @@ def mirror_arch(arch_wish, state_dir):
                 continue
             seen_names.add(name_raw)
             todo.append((uid, pkg))
+
+    # See mirror_ubuntu.py's identical note: "Architecture: all" packages
+    # are already inlined into binary-<arch>/Packages.gz by the upstream
+    # archive, no separate fetch needed. Debian's archive follows the same
+    # convention as Ubuntu's here.
+    todo, seen_names = [], set()
+    for comp in COMPONENTS:
+        collect(fetch_packages_index(base, RELEASE, comp, cfg["deb_arch"]))
 
     print(f"{len(todo)} packages left for {label}", file=sys.stderr)
 
