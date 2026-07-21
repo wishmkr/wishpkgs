@@ -2,18 +2,19 @@ name: Test, heal, and re-verify the package catalog
 
 # Three-phase, self-healing pass over the live catalog:
 #
-#  1. test-phase1 (10 shards total, not per arch -- each shard job works
+#  1. test-phase1 (20 shards total, not per arch -- each shard job works
 #     its slice of every requested arch in turn): walks every package's
 #     full dependency closure exactly like wish's own resolver, downloading
 #     + checksum-verifying + extract-checking everything. Anything with no
 #     .info at all anywhere in a closure is collected as a "missing name".
-#  2. heal (1 job/arch): for every missing name, tries to actually mirror it
-#     in for real -- checks Ubuntu (main/universe/multiverse/restricted),
+#  2. heal (7 fixers total, not per arch): for every missing name, tries to
+#     actually mirror it in for real -- checks Ubuntu (main/universe/
+#     multiverse/restricted),
 #     then Debian (main/contrib/non-free-firmware), then Fedora
 #     (Everything), in that order, and republishes index/<arch>.txt with
 #     whatever it found. This is the ONLY step that writes to B2 -- needs
 #     the same B2 credentials the mirror workflows use.
-#  3. test-phase2 (10 shards total, same shape as phase1): re-checks ONLY
+#  3. test-phase2 (20 shards total, same shape as phase1): re-checks ONLY
 #     the names heal.py just tried to fix (not the whole catalog again) to
 #     see whether the fix actually landed. Anything still broken here is a
 #     real problem (most often a Debian/Ubuntu "virtual" package name like
@@ -56,13 +57,13 @@ jobs:
           python3 - "$ARCHS" <<'PY' >> "$GITHUB_OUTPUT"
           import json, sys
           archs = [a.strip() for a in sys.argv[1].split(",") if a.strip()]
-          print("shards=" + json.dumps({"include": [{"shard": s} for s in range(10)]}))
+          print("shards=" + json.dumps({"include": [{"shard": s} for s in range(20)]}))
           print("fixers=" + json.dumps({"include": [{"shard": s} for s in range(7)]}))
           print("archs=" + json.dumps(archs))
           PY
 
   # ---- phase 1: discover ----
-  # Exactly 10 shards total (not 10 per arch) -- each shard job tests its
+  # Exactly 20 shards total (not 20 per arch) -- each shard job tests its
   # slice of every requested arch in turn, sequentially within the same job.
   test-phase1:
     needs: plan
@@ -73,7 +74,7 @@ jobs:
     timeout-minutes: 355
     env:
       TEST_SHARD: ${{ matrix.shard }}
-      TEST_SHARDS: "10"
+      TEST_SHARDS: "20"
       TEST_OUTPUT_DIR: results1
     steps:
       - uses: actions/checkout@v4
@@ -179,7 +180,7 @@ jobs:
           retention-days: 14
 
   # ---- phase 2b: re-verify exactly what heal tried to fix ----
-  # Same "10 shards total, not per arch" shape as phase1 -- each shard job
+  # Same "20 shards total, not per arch" shape as phase1 -- each shard job
   # re-verifies its slice of every requested arch's missing-name list.
   test-phase2:
     needs: [plan, heal]
@@ -202,7 +203,7 @@ jobs:
           for arch in $(echo '${{ needs.plan.outputs.archs }}' | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
             python3 - "$arch" ${{ matrix.shard }} <<'PY'
           import hashlib, sys
-          arch, shard, num_shards = sys.argv[1], int(sys.argv[2]), 10
+          arch, shard, num_shards = sys.argv[1], int(sys.argv[2]), 20
           with open(f"missing-names/missing-names-{arch}.txt") as f:
               names = [l.strip() for l in f if l.strip()]
           mine = [n for n in names
@@ -211,7 +212,7 @@ jobs:
               f.writelines(f"{n}\n" for n in mine)
           print(f"{arch}: {len(mine)}/{len(names)} names assigned to this shard")
           PY
-            TEST_ARCH="$arch" TEST_SHARD="${{ matrix.shard }}" TEST_SHARDS="10" \
+            TEST_ARCH="$arch" TEST_SHARD="${{ matrix.shard }}" TEST_SHARDS="20" \
               TEST_NAMES_FILE=my-names.txt TEST_OUTPUT_DIR=results2 \
               python3 tools/test_packages.py
           done
