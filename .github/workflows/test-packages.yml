@@ -46,6 +46,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       shards: ${{ steps.gen.outputs.shards }}
+      fixers: ${{ steps.gen.outputs.fixers }}
       archs: ${{ steps.gen.outputs.archs }}
     steps:
       - id: gen
@@ -56,6 +57,7 @@ jobs:
           import json, sys
           archs = [a.strip() for a in sys.argv[1].split(",") if a.strip()]
           print("shards=" + json.dumps({"include": [{"shard": s} for s in range(10)]}))
+          print("fixers=" + json.dumps({"include": [{"shard": s} for s in range(7)]}))
           print("archs=" + json.dumps(archs))
           PY
 
@@ -133,19 +135,24 @@ jobs:
           retention-days: 7
 
   # ---- phase 2a: heal (writes to B2 -- only job in this workflow that does) ----
+  # 7 fixers total, not per arch: each one claims its own hash-partitioned
+  # slice of every requested arch's missing-name list (see in_shard() in
+  # heal_missing.py) so they never race trying to mirror the same name in
+  # twice, then searches Ubuntu -> Debian -> Fedora for its slice and
+  # reports what it found.
   heal:
     needs: [plan, collect-missing]
     if: needs.collect-missing.outputs.any_missing == 'true'
     strategy:
       fail-fast: false
-      matrix:
-        arch: ${{ fromJson(needs.plan.outputs.archs) }}
+      matrix: ${{ fromJson(needs.plan.outputs.fixers) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
       AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
-      HEAL_ARCH: ${{ matrix.arch }}
+      HEAL_SHARD: ${{ matrix.shard }}
+      HEAL_SHARDS: "7"
       HEAL_OUTPUT_DIR: heal-results
     steps:
       - uses: actions/checkout@v4
@@ -154,22 +161,20 @@ jobs:
           name: missing-names
           path: missing-names
 
-      - name: Heal missing names for ${{ matrix.arch }}
+      - name: Fixer ${{ matrix.shard }} -- heal its slice across all requested archs
         run: |
           set -eu
-          f="missing-names/missing-names-${{ matrix.arch }}.txt"
-          if [ -s "$f" ]; then
-            python3 tools/heal_missing.py "$f"
-          else
-            echo "nothing missing for ${{ matrix.arch }}"
-            mkdir -p heal-results
-            echo '{}' > heal-results/heal-report-${{ matrix.arch }}.json
-          fi
+          mkdir -p heal-results
+          args=""
+          for arch in $(echo '${{ needs.plan.outputs.archs }}' | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
+            args="$args $arch:missing-names/missing-names-$arch.txt"
+          done
+          python3 tools/heal_missing.py $args
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: heal-${{ matrix.arch }}
+          name: heal-shard${{ matrix.shard }}
           path: heal-results/*.json
           retention-days: 14
 

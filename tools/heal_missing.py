@@ -23,13 +23,14 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mirror_common import sanitize_name, is_blocked, b2_cp, b2_get, sh
+from mirror_common import sanitize_name, is_blocked, in_shard, b2_cp, b2_get, sh
 
 import mirror_ubuntu
 import mirror_debian
 import mirror_fedora
 
-ARCH = os.environ.get("HEAL_ARCH", "aarch64")
+SHARD = int(os.environ.get("HEAL_SHARD", "0"))
+NUM_SHARDS = max(1, int(os.environ.get("HEAL_SHARDS", "1")))
 DEADLINE = time.monotonic() + float(os.environ.get("HEAL_DEADLINE_SECONDS", "19500"))
 
 
@@ -148,21 +149,25 @@ def publish_healed(arch, wsh_names):
     os.remove(out)
 
 
-def main():
-    names_file = sys.argv[1] if len(sys.argv) > 1 else "missing-names.txt"
+def heal_arch(arch, names_file, workdir):
     with open(names_file) as f:
-        wanted = {l.strip() for l in f if l.strip()}
+        all_names = {l.strip() for l in f if l.strip()}
 
-    print(f"healing {len(wanted)} missing names for arch={ARCH}", file=sys.stderr)
+    # This fixer's slice only -- with NUM_SHARDS fixers all pulling from the
+    # same missing-names list, each one only claims and heals the subset
+    # in_shard() assigns it, so multiple fixers never race on the same name.
+    wanted = {n for n in all_names if in_shard(n, SHARD, NUM_SHARDS)}
+    print(f"fixer {SHARD}/{NUM_SHARDS} arch={arch}: "
+          f"{len(wanted)}/{len(all_names)} names assigned", file=sys.stderr)
 
-    workdir = tempfile.mkdtemp()
     all_healed = {}
-
     for try_fn in (try_ubuntu, try_debian, try_fedora):
-        found = try_fn(wanted, ARCH, workdir)
+        if deadline_hit():
+            break
+        found = try_fn(wanted, arch, workdir)
         all_healed.update(found)
 
-    publish_healed(ARCH, [wsh for _, wsh in all_healed.values()])
+    publish_healed(arch, [wsh for _, wsh in all_healed.values()])
 
     report = {
         name: {"status": "healed", "source": src, "file": wsh}
@@ -173,12 +178,30 @@ def main():
 
     out_dir = os.environ.get("HEAL_OUTPUT_DIR", ".")
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, f"heal-report-{ARCH}.json")
+    out_path = os.path.join(out_dir, f"heal-report-{arch}-shard{SHARD}.json")
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2, sort_keys=True)
 
-    print(f"healed {len(all_healed)}, unresolved {len(wanted)}", file=sys.stderr)
+    print(f"arch={arch}: healed {len(all_healed)}, unresolved {len(wanted)}", file=sys.stderr)
     print(f"wrote {out_path}", file=sys.stderr)
+
+
+def main():
+    # sys.argv[1:] is a list of "<arch>:<names-file>" pairs, one per
+    # requested arch (a fixer handles every arch's slice in one job, same
+    # shape as test_packages.py's phase1/2 shard loop).
+    if len(sys.argv) < 2:
+        print("usage: heal_missing.py <arch>:<names-file> [<arch>:<names-file> ...]",
+              file=sys.stderr)
+        sys.exit(1)
+
+    workdir = tempfile.mkdtemp()
+    for spec in sys.argv[1:]:
+        if deadline_hit():
+            print("deadline reached, stopping cleanly", file=sys.stderr)
+            break
+        arch, _, names_file = spec.partition(":")
+        heal_arch(arch, names_file, workdir)
 
 
 if __name__ == "__main__":
