@@ -1,30 +1,28 @@
-name: Test, heal, and re-verify the package catalog
+name: Test, heal, and re-verify the package catalog (3 rounds)
 
-# Three-phase, self-healing pass over the live catalog:
+# Chains 3 full heal -> verify rounds instead of just one, because healing a
+# missing name can itself introduce brand new missing names one level down
+# (its own freshly-published .info lists dependencies nobody's checked yet)
+# -- one pass typically only resolves a fraction of the real gap. Each round
+# narrows the remaining set further:
 #
-#  1. test-phase1 (20 shards total, not per arch -- each shard job works
-#     its slice of every requested arch in turn): walks every package's
-#     full dependency closure exactly like wish's own resolver, downloading
-#     + checksum-verifying + extract-checking everything. Anything with no
-#     .info at all anywhere in a closure is collected as a "missing name".
-#  2. heal (7 fixers total, not per arch): for every missing name, tries to
-#     actually mirror it in for real -- checks Ubuntu (main/universe/
-#     multiverse/restricted),
-#     then Debian (main/contrib/non-free-firmware), then Fedora
-#     (Everything), in that order, and republishes index/<arch>.txt with
-#     whatever it found. This is the ONLY step that writes to B2 -- needs
-#     the same B2 credentials the mirror workflows use.
-#  3. test-phase2 (20 shards total, same shape as phase1): re-checks ONLY
-#     the names heal.py just tried to fix (not the whole catalog again) to
-#     see whether the fix actually landed. Anything still broken here is a
-#     real problem (most often a Debian/Ubuntu "virtual" package name like
-#     dpkg-dev or perl-any that was never a real installable package to
-#     begin with, not a mirroring gap) and goes straight into the final
-#     report for a human to look at -- nothing here guesses or auto-fixes
-#     further.
+#   test-phase1 (discover, 20 shards total)
+#     -> heal round 1 (7 fixers)   -> verify round 1 (20 shards)
+#     -> heal round 2 (7 fixers)   -> verify round 2 (20 shards)
+#     -> heal round 3 (7 fixers)   -> verify round 3 (20 shards)
+#     -> summary-log
 #
-# test-phase1/2 are read-only against the public CDN (no secrets needed);
-# only the heal job touches B2.
+# Every verify round re-checks exactly the names the matching heal round
+# just tried to fix, and (like phase1) also surfaces any NEW missing names
+# it finds deeper in those packages' own dependency chains -- that's what
+# feeds the next round's heal step.
+#
+# summary-log covers EVERY name ever tested across all 4 test rounds
+# (phase1 + verify 1/2/3), both ok and failing -- not just the failures --
+# as one full tab-separated log plus a count summary.
+#
+# Only the heal jobs write to B2 (need those credentials); every test/verify
+# job is read-only against the public CDN.
 on:
   workflow_dispatch:
     inputs:
@@ -62,9 +60,7 @@ jobs:
           print("archs=" + json.dumps(archs))
           PY
 
-  # ---- phase 1: discover ----
-  # Exactly 20 shards total (not 20 per arch) -- each shard job tests its
-  # slice of every requested arch in turn, sequentially within the same job.
+  # ==== discover: full catalog scan, 20 shards total (not per arch) ====
   test-phase1:
     needs: plan
     strategy:
@@ -75,7 +71,7 @@ jobs:
     env:
       TEST_SHARD: ${{ matrix.shard }}
       TEST_SHARDS: "20"
-      TEST_OUTPUT_DIR: results1
+      TEST_OUTPUT_DIR: results-phase1
     steps:
       - uses: actions/checkout@v4
       - name: Test shard ${{ matrix.shard }} across all requested archs
@@ -87,12 +83,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: phase1-shard${{ matrix.shard }}
-          path: results1/*.json
-          retention-days: 7
+          name: results-phase1-shard${{ matrix.shard }}
+          path: results-phase1/*.json
+          retention-days: 30
 
-  # ---- collect: distinct missing names per arch ----
-  collect-missing:
+  collect-1:
     needs: [plan, test-phase1]
     if: always()
     runs-on: ubuntu-24.04
@@ -102,21 +97,18 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: phase1-*
-          path: results1
+          pattern: results-phase1-shard*
+          path: results-phase1
           merge-multiple: true
-
       - id: collect
         run: |
           python3 - <<'PY'
           import glob, json, os
-
           by_arch = {}
-          for path in glob.glob("results1/results-*-shard*.json"):
+          for path in glob.glob("results-phase1/results-*-shard*.json"):
               with open(path) as f:
                   d = json.load(f)
               by_arch.setdefault(d["arch"], set()).update(d.get("missing_names", []))
-
           any_missing = False
           for arch, names in by_arch.items():
               if names:
@@ -124,26 +116,19 @@ jobs:
               with open(f"missing-names-{arch}.txt", "w") as f:
                   f.writelines(f"{n}\n" for n in sorted(names))
               print(f"{arch}: {len(names)} distinct missing names")
-
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"any_missing={'true' if any_missing else 'false'}\n")
           PY
-
       - uses: actions/upload-artifact@v4
         with:
-          name: missing-names
+          name: missing-names-round1
           path: missing-names-*.txt
           retention-days: 7
 
-  # ---- phase 2a: heal (writes to B2 -- only job in this workflow that does) ----
-  # 7 fixers total, not per arch: each one claims its own hash-partitioned
-  # slice of every requested arch's missing-name list (see in_shard() in
-  # heal_missing.py) so they never race trying to mirror the same name in
-  # twice, then searches Ubuntu -> Debian -> Fedora for its slice and
-  # reports what it found.
-  heal:
-    needs: [plan, collect-missing]
-    if: needs.collect-missing.outputs.any_missing == 'true'
+  # ==== round 1: heal -> verify ====
+  heal-round1:
+    needs: [plan, collect-1]
+    if: needs.collect-1.outputs.any_missing == 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.fixers) }}
@@ -159,10 +144,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: missing-names
+          name: missing-names-round1
           path: missing-names
-
-      - name: Fixer ${{ matrix.shard }} -- heal its slice across all requested archs
+      - name: Fixer ${{ matrix.shard }} -- round 1
         run: |
           set -eu
           mkdir -p heal-results
@@ -171,20 +155,16 @@ jobs:
             args="$args $arch:missing-names/missing-names-$arch.txt"
           done
           python3 tools/heal_missing.py $args
-
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: heal-shard${{ matrix.shard }}
+          name: heal-round1-shard${{ matrix.shard }}
           path: heal-results/*.json
-          retention-days: 14
+          retention-days: 30
 
-  # ---- phase 2b: re-verify exactly what heal tried to fix ----
-  # Same "20 shards total, not per arch" shape as phase1 -- each shard job
-  # re-verifies its slice of every requested arch's missing-name list.
-  test-phase2:
-    needs: [plan, heal]
-    if: always() && needs.heal.result != 'skipped'
+  verify-round1:
+    needs: [plan, heal-round1]
+    if: always() && needs.heal-round1.result != 'skipped'
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan.outputs.shards) }}
@@ -194,10 +174,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: missing-names
+          name: missing-names-round1
           path: missing-names
-
-      - name: Re-verify shard ${{ matrix.shard }} across all requested archs
+      - name: Re-verify shard ${{ matrix.shard }}
         run: |
           set -eu
           for arch in $(echo '${{ needs.plan.outputs.archs }}' | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
@@ -213,89 +192,366 @@ jobs:
           print(f"{arch}: {len(mine)}/{len(names)} names assigned to this shard")
           PY
             TEST_ARCH="$arch" TEST_SHARD="${{ matrix.shard }}" TEST_SHARDS="20" \
-              TEST_NAMES_FILE=my-names.txt TEST_OUTPUT_DIR=results2 \
+              TEST_NAMES_FILE=my-names.txt TEST_OUTPUT_DIR=results-verify1 \
               python3 tools/test_packages.py
           done
-
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: phase2-shard${{ matrix.shard }}
-          path: results2/*.json
+          name: results-verify1-shard${{ matrix.shard }}
+          path: results-verify1/*.json
           retention-days: 30
 
-  # ---- final report: whatever's still broken after healing + re-verify ----
-  final-report:
-    needs: [test-phase2, heal]
+  # ==== round 2: heal -> verify (targets whatever round 1's verify still found missing) ====
+  collect-2:
+    needs: [plan, verify-round1]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      any_missing: ${{ steps.collect.outputs.any_missing }}
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: phase2-*
-          path: results2
+          pattern: results-verify1-shard*
+          path: results-verify1
           merge-multiple: true
         continue-on-error: true
+      - id: collect
+        run: |
+          python3 - <<'PY'
+          import glob, json, os
+          by_arch = {}
+          for path in glob.glob("results-verify1/results-*-shard*.json"):
+              with open(path) as f:
+                  d = json.load(f)
+              by_arch.setdefault(d["arch"], set()).update(d.get("missing_names", []))
+          any_missing = False
+          for arch in ${{ needs.plan.outputs.archs }}:
+              names = by_arch.get(arch, set())
+              if names:
+                  any_missing = True
+              with open(f"missing-names-{arch}.txt", "w") as f:
+                  f.writelines(f"{n}\n" for n in sorted(names))
+              print(f"{arch}: {len(names)} distinct missing names")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"any_missing={'true' if any_missing else 'false'}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: missing-names-round2
+          path: missing-names-*.txt
+          retention-days: 7
 
+  heal-round2:
+    needs: [plan, collect-2]
+    if: needs.collect-2.outputs.any_missing == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.fixers) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      HEAL_SHARD: ${{ matrix.shard }}
+      HEAL_SHARDS: "7"
+      HEAL_OUTPUT_DIR: heal-results
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: heal-*
-          path: heal
+          name: missing-names-round2
+          path: missing-names
+      - name: Fixer ${{ matrix.shard }} -- round 2
+        run: |
+          set -eu
+          mkdir -p heal-results
+          args=""
+          for arch in $(echo '${{ needs.plan.outputs.archs }}' | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
+            args="$args $arch:missing-names/missing-names-$arch.txt"
+          done
+          python3 tools/heal_missing.py $args
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: heal-round2-shard${{ matrix.shard }}
+          path: heal-results/*.json
+          retention-days: 30
+
+  verify-round2:
+    needs: [plan, heal-round2]
+    if: always() && needs.heal-round2.result != 'skipped'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.shards) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: missing-names-round2
+          path: missing-names
+      - name: Re-verify shard ${{ matrix.shard }}
+        run: |
+          set -eu
+          for arch in $(echo '${{ needs.plan.outputs.archs }}' | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
+            python3 - "$arch" ${{ matrix.shard }} <<'PY'
+          import hashlib, sys
+          arch, shard, num_shards = sys.argv[1], int(sys.argv[2]), 20
+          with open(f"missing-names/missing-names-{arch}.txt") as f:
+              names = [l.strip() for l in f if l.strip()]
+          mine = [n for n in names
+                  if int(hashlib.md5(n.encode()).hexdigest(), 16) % num_shards == shard]
+          with open("my-names.txt", "w") as f:
+              f.writelines(f"{n}\n" for n in mine)
+          print(f"{arch}: {len(mine)}/{len(names)} names assigned to this shard")
+          PY
+            TEST_ARCH="$arch" TEST_SHARD="${{ matrix.shard }}" TEST_SHARDS="20" \
+              TEST_NAMES_FILE=my-names.txt TEST_OUTPUT_DIR=results-verify2 \
+              python3 tools/test_packages.py
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-verify2-shard${{ matrix.shard }}
+          path: results-verify2/*.json
+          retention-days: 30
+
+  # ==== round 3: heal -> verify ====
+  collect-3:
+    needs: [plan, verify-round2]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      any_missing: ${{ steps.collect.outputs.any_missing }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-verify2-shard*
+          path: results-verify2
+          merge-multiple: true
+        continue-on-error: true
+      - id: collect
+        run: |
+          python3 - <<'PY'
+          import glob, json, os
+          by_arch = {}
+          for path in glob.glob("results-verify2/results-*-shard*.json"):
+              with open(path) as f:
+                  d = json.load(f)
+              by_arch.setdefault(d["arch"], set()).update(d.get("missing_names", []))
+          any_missing = False
+          for arch in ${{ needs.plan.outputs.archs }}:
+              names = by_arch.get(arch, set())
+              if names:
+                  any_missing = True
+              with open(f"missing-names-{arch}.txt", "w") as f:
+                  f.writelines(f"{n}\n" for n in sorted(names))
+              print(f"{arch}: {len(names)} distinct missing names")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"any_missing={'true' if any_missing else 'false'}\n")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: missing-names-round3
+          path: missing-names-*.txt
+          retention-days: 7
+
+  heal-round3:
+    needs: [plan, collect-3]
+    if: needs.collect-3.outputs.any_missing == 'true'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.fixers) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    env:
+      AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      HEAL_SHARD: ${{ matrix.shard }}
+      HEAL_SHARDS: "7"
+      HEAL_OUTPUT_DIR: heal-results
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: missing-names-round3
+          path: missing-names
+      - name: Fixer ${{ matrix.shard }} -- round 3
+        run: |
+          set -eu
+          mkdir -p heal-results
+          args=""
+          for arch in $(echo '${{ needs.plan.outputs.archs }}' | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
+            args="$args $arch:missing-names/missing-names-$arch.txt"
+          done
+          python3 tools/heal_missing.py $args
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: heal-round3-shard${{ matrix.shard }}
+          path: heal-results/*.json
+          retention-days: 30
+
+  verify-round3:
+    needs: [plan, heal-round3]
+    if: always() && needs.heal-round3.result != 'skipped'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.plan.outputs.shards) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: missing-names-round3
+          path: missing-names
+      - name: Re-verify shard ${{ matrix.shard }}
+        run: |
+          set -eu
+          for arch in $(echo '${{ needs.plan.outputs.archs }}' | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
+            python3 - "$arch" ${{ matrix.shard }} <<'PY'
+          import hashlib, sys
+          arch, shard, num_shards = sys.argv[1], int(sys.argv[2]), 20
+          with open(f"missing-names/missing-names-{arch}.txt") as f:
+              names = [l.strip() for l in f if l.strip()]
+          mine = [n for n in names
+                  if int(hashlib.md5(n.encode()).hexdigest(), 16) % num_shards == shard]
+          with open("my-names.txt", "w") as f:
+              f.writelines(f"{n}\n" for n in mine)
+          print(f"{arch}: {len(mine)}/{len(names)} names assigned to this shard")
+          PY
+            TEST_ARCH="$arch" TEST_SHARD="${{ matrix.shard }}" TEST_SHARDS="20" \
+              TEST_NAMES_FILE=my-names.txt TEST_OUTPUT_DIR=results-verify3 \
+              python3 tools/test_packages.py
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-verify3-shard${{ matrix.shard }}
+          path: results-verify3/*.json
+          retention-days: 30
+
+  # ==== final summary-log: every name tested across all 4 rounds, ok AND failing ====
+  summary-log:
+    needs: [verify-round3]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Each round's shard files are all named results-<arch>-shard<N>.json
+      # -- downloading them into separate directories (not merged together)
+      # so a later round's shard0 doesn't physically overwrite an earlier
+      # round's shard0 on disk before the aggregation script ever runs.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-phase1-shard*
+          path: all-results/phase1
+          merge-multiple: true
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-verify1-shard*
+          path: all-results/verify1
+          merge-multiple: true
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-verify2-shard*
+          path: all-results/verify2
+          merge-multiple: true
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-verify3-shard*
+          path: all-results/verify3
+          merge-multiple: true
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: heal-round1-shard*
+          path: all-heal/round1
+          merge-multiple: true
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: heal-round2-shard*
+          path: all-heal/round2
+          merge-multiple: true
+        continue-on-error: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: heal-round3-shard*
+          path: all-heal/round3
           merge-multiple: true
         continue-on-error: true
 
-      - name: Build final report
+      - name: Build full DONE + FAIL log and summary
         run: |
           python3 - <<'PY'
           import glob, json
 
           heal_reports = {}
-          for path in glob.glob("heal/heal-report-*.json"):
+          for path in glob.glob("all-heal/round*/heal-report-*.json"):
               with open(path) as f:
                   heal_reports.update(json.load(f))
 
-          still_failing = {}
-          totals = {}
-          for path in glob.glob("results2/results-*-shard*.json"):
-              with open(path) as f:
-                  d = json.load(f)
-              arch = d["arch"]
-              totals[arch] = totals.get(arch, 0) + d["tested"]
-              for name, outcome in d["results"].items():
-                  if outcome != "ok":
-                      still_failing[name] = outcome
+          # Latest-known status per (arch, name) across every round -- a
+          # later round's result for the same name supersedes an earlier
+          # one, since it reflects the state after more healing. Each round
+          # was downloaded into its own subdirectory (see the download steps
+          # above) specifically so same-named shard files from different
+          # rounds don't clobber each other on disk before we get here.
+          latest = {}
+          for round_dir in ("phase1", "verify1", "verify2", "verify3"):
+              for path in glob.glob(f"all-results/{round_dir}/results-*-shard*.json"):
+                  with open(path) as f:
+                      d = json.load(f)
+                  arch = d["arch"]
+                  for name, outcome in d["results"].items():
+                      latest[(arch, name)] = outcome
 
-          lines = ["# Final report: heal + re-verify\n\n"]
-          lines.append(f"Names heal.py attempted: {len(heal_reports)}\n")
+          ok_count = sum(1 for v in latest.values() if v == "ok")
+          fail_count = len(latest) - ok_count
+
+          with open("full-results.log", "w") as f:
+              for (arch, name), outcome in sorted(latest.items()):
+                  status = "DONE" if outcome == "ok" else "FAIL"
+                  f.write(f"{status}\t{arch}\t{name}\t{outcome}\n")
+
+          lines = ["# 3-round heal + verify: final summary\n\n"]
+          lines.append(f"Total distinct (arch, package) checked across all rounds: {len(latest)}\n")
+          lines.append(f"  - DONE (ok): {ok_count}\n")
+          lines.append(f"  - FAIL: {fail_count}\n\n")
+
+          lines.append("## Heal totals (all 3 rounds combined)\n")
           healed_ok = sum(1 for v in heal_reports.values() if v.get("status") == "healed")
-          lines.append(f"  - actually mirrored in: {healed_ok}\n")
-          lines.append(f"  - not found anywhere (ubuntu/debian/fedora): "
-                        f"{len(heal_reports) - healed_ok}\n\n")
-          lines.append(f"Re-verified: {sum(totals.values())} names\n")
-          lines.append(f"Still failing after heal: {len(still_failing)}\n\n")
+          lines.append(f"- names heal.py attempted: {len(heal_reports)}\n")
+          lines.append(f"- actually mirrored in: {healed_ok}\n")
+          lines.append(f"- not found anywhere (ubuntu/debian/fedora): {len(heal_reports) - healed_ok}\n\n")
 
-          lines.append("## Still failing (needs a human look)\n")
-          for name, outcome in sorted(still_failing.items()):
-              source = heal_reports.get(name, {})
-              status = source.get("status", "?")
-              lines.append(f"- `{name}`: {outcome} (heal status: {status})\n")
+          lines.append("## Still failing after round 3 (first 100)\n")
+          still_failing = [(a, n, o) for (a, n), o in sorted(latest.items()) if o != "ok"]
+          for arch, name, outcome in still_failing[:100]:
+              lines.append(f"- `{arch}/{name}`: {outcome}\n")
 
           summary = "".join(lines)
-          with open("final-summary.md", "w") as f:
+          with open("summary.md", "w") as f:
               f.write(summary)
-          with open("final-still-failing.json", "w") as f:
-              json.dump(still_failing, f, indent=2, sort_keys=True)
           print(summary)
           PY
 
       - name: Write to job summary
-        run: cat final-summary.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat summary.md >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: final-report
+          name: summary-log
           path: |
-            final-summary.md
-            final-still-failing.json
+            summary.md
+            full-results.log
           retention-days: 60
