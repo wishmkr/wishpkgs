@@ -2,23 +2,25 @@ name: Test, heal, and re-verify the package catalog
 
 # Three-phase, self-healing pass over the live catalog:
 #
-#  1. test-phase1 (10 shards/arch): walks every package's full dependency
-#     closure exactly like wish's own resolver, downloading + checksum-
-#     verifying + extract-checking everything. Anything with no .info at
-#     all anywhere in a closure is collected as a "missing name".
+#  1. test-phase1 (10 shards total, not per arch -- each shard job works
+#     its slice of every requested arch in turn): walks every package's
+#     full dependency closure exactly like wish's own resolver, downloading
+#     + checksum-verifying + extract-checking everything. Anything with no
+#     .info at all anywhere in a closure is collected as a "missing name".
 #  2. heal (1 job/arch): for every missing name, tries to actually mirror it
 #     in for real -- checks Ubuntu (main/universe/multiverse/restricted),
 #     then Debian (main/contrib/non-free-firmware), then Fedora
 #     (Everything), in that order, and republishes index/<arch>.txt with
 #     whatever it found. This is the ONLY step that writes to B2 -- needs
 #     the same B2 credentials the mirror workflows use.
-#  3. test-phase2 (10 shards/arch): re-checks ONLY the names heal.py just
-#     tried to fix (not the whole catalog again) to see whether the fix
-#     actually landed. Anything still broken here is a real problem (most
-#     often a Debian/Ubuntu "virtual" package name like dpkg-dev or
-#     perl-any that was never a real installable package to begin with,
-#     not a mirroring gap) and goes straight into the final report for a
-#     human to look at -- nothing here guesses or auto-fixes further.
+#  3. test-phase2 (10 shards total, same shape as phase1): re-checks ONLY
+#     the names heal.py just tried to fix (not the whole catalog again) to
+#     see whether the fix actually landed. Anything still broken here is a
+#     real problem (most often a Debian/Ubuntu "virtual" package name like
+#     dpkg-dev or perl-any that was never a real installable package to
+#     begin with, not a mirroring gap) and goes straight into the final
+#     report for a human to look at -- nothing here guesses or auto-fixes
+#     further.
 #
 # test-phase1/2 are read-only against the public CDN (no secrets needed);
 # only the heal job touches B2.
@@ -43,8 +45,7 @@ jobs:
   plan:
     runs-on: ubuntu-24.04
     outputs:
-      matrix1: ${{ steps.gen.outputs.matrix1 }}
-      matrix2: ${{ steps.gen.outputs.matrix2 }}
+      shards: ${{ steps.gen.outputs.shards }}
       archs: ${{ steps.gen.outputs.archs }}
     steps:
       - id: gen
@@ -54,32 +55,36 @@ jobs:
           python3 - "$ARCHS" <<'PY' >> "$GITHUB_OUTPUT"
           import json, sys
           archs = [a.strip() for a in sys.argv[1].split(",") if a.strip()]
-          combos = [{"arch": a, "shard": s} for a in archs for s in range(10)]
-          print("matrix1=" + json.dumps({"include": combos}))
-          print("matrix2=" + json.dumps({"include": combos}))
+          print("shards=" + json.dumps({"include": [{"shard": s} for s in range(10)]}))
           print("archs=" + json.dumps(archs))
           PY
 
   # ---- phase 1: discover ----
+  # Exactly 10 shards total (not 10 per arch) -- each shard job tests its
+  # slice of every requested arch in turn, sequentially within the same job.
   test-phase1:
     needs: plan
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.matrix1) }}
+      matrix: ${{ fromJson(needs.plan.outputs.shards) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     env:
-      TEST_ARCH: ${{ matrix.arch }}
       TEST_SHARD: ${{ matrix.shard }}
       TEST_SHARDS: "10"
       TEST_OUTPUT_DIR: results1
     steps:
       - uses: actions/checkout@v4
-      - run: python3 tools/test_packages.py
+      - name: Test shard ${{ matrix.shard }} across all requested archs
+        run: |
+          set -eu
+          for arch in $(echo '${{ needs.plan.outputs.archs }}' | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
+            TEST_ARCH="$arch" python3 tools/test_packages.py
+          done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: phase1-${{ matrix.arch }}-shard${{ matrix.shard }}
+          name: phase1-shard${{ matrix.shard }}
           path: results1/*.json
           retention-days: 7
 
@@ -169,12 +174,14 @@ jobs:
           retention-days: 14
 
   # ---- phase 2b: re-verify exactly what heal tried to fix ----
+  # Same "10 shards total, not per arch" shape as phase1 -- each shard job
+  # re-verifies its slice of every requested arch's missing-name list.
   test-phase2:
     needs: [plan, heal]
     if: always() && needs.heal.result != 'skipped'
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(needs.plan.outputs.matrix2) }}
+      matrix: ${{ fromJson(needs.plan.outputs.shards) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 355
     steps:
@@ -184,33 +191,30 @@ jobs:
           name: missing-names
           path: missing-names
 
-      - name: Split names for this shard
+      - name: Re-verify shard ${{ matrix.shard }} across all requested archs
         run: |
-          python3 - <<PY
-          import hashlib
-          arch, shard, num_shards = "${{ matrix.arch }}", ${{ matrix.shard }}, 10
+          set -eu
+          for arch in $(echo '${{ needs.plan.outputs.archs }}' | python3 -c "import json,sys; print(' '.join(json.load(sys.stdin)))"); do
+            python3 - "$arch" ${{ matrix.shard }} <<'PY'
+          import hashlib, sys
+          arch, shard, num_shards = sys.argv[1], int(sys.argv[2]), 10
           with open(f"missing-names/missing-names-{arch}.txt") as f:
               names = [l.strip() for l in f if l.strip()]
           mine = [n for n in names
                   if int(hashlib.md5(n.encode()).hexdigest(), 16) % num_shards == shard]
           with open("my-names.txt", "w") as f:
               f.writelines(f"{n}\n" for n in mine)
-          print(f"{len(mine)}/{len(names)} names assigned to this shard")
+          print(f"{arch}: {len(mine)}/{len(names)} names assigned to this shard")
           PY
-
-      - name: Re-verify
-        env:
-          TEST_ARCH: ${{ matrix.arch }}
-          TEST_SHARD: ${{ matrix.shard }}
-          TEST_SHARDS: "10"
-          TEST_NAMES_FILE: my-names.txt
-          TEST_OUTPUT_DIR: results2
-        run: python3 tools/test_packages.py
+            TEST_ARCH="$arch" TEST_SHARD="${{ matrix.shard }}" TEST_SHARDS="10" \
+              TEST_NAMES_FILE=my-names.txt TEST_OUTPUT_DIR=results2 \
+              python3 tools/test_packages.py
+          done
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: phase2-${{ matrix.arch }}-shard${{ matrix.shard }}
+          name: phase2-shard${{ matrix.shard }}
           path: results2/*.json
           retention-days: 30
 
