@@ -130,6 +130,87 @@ def sanitize_depends_list(names):
     return out
 
 
+# ---- structured dependency/provides/conflicts fields ----
+#
+# Older mirror code threw away version constraints and every alternative
+# after the first "|" in a Depends field -- there was no way to use that
+# information (no version comparison, no virtual-package resolution). The
+# resolver on the wish side now understands both, so this preserves them
+# instead: a dependency field is a list of OR-groups, each an alternation
+# of (name, op, version) triples where op is one of ">=","<=","=","<",">"
+# or "" for "any version".
+_CONSTRAINT_RE = re.compile(r"\(\s*(>=|<=|=|>>|<<|>|<)\s*([^)]+)\)")
+_RPM_FLAG_TO_OP = {"GE": ">=", "LE": "<=", "EQ": "=", "LT": "<", "GT": ">"}
+
+
+def parse_dep_field(field):
+    """Parses a Debian-style Depends/Conflicts/Breaks/Provides field, e.g.
+    "foo (>= 1.2) | bar, baz" -> [[("foo",">=","1.2"), ("bar","","")],
+    [("baz","","")]] (outer list = comma-separated OR-groups, inner list =
+    pipe-separated alternatives within one group)."""
+    if not field:
+        return []
+    groups = []
+    for group in field.split(","):
+        alts = []
+        for alt in group.split("|"):
+            alt = alt.strip()
+            if not alt:
+                continue
+            m = _CONSTRAINT_RE.search(alt)
+            name_part = alt[:m.start()].strip() if m else alt
+            name_part = name_part.split()[0] if name_part else ""
+            if not name_part:
+                continue
+            op, ver = "", ""
+            if m:
+                op = m.group(1)
+                if op == ">>":
+                    op = ">"
+                elif op == "<<":
+                    op = "<"
+                ver = sanitize_version(m.group(2))
+            alts.append((sanitize_name(name_part), op, ver))
+        if alts:
+            groups.append(alts)
+    return groups
+
+
+def rpm_entries_to_groups(entries):
+    """Same output shape as parse_dep_field(), but from parsed RPM
+    <rpm:entry name=".." flags=".." ver=".."/> tuples (each entry is its
+    own OR-group of one -- RPM doesn't have Debian's "|" alternation)."""
+    groups = []
+    for name, flags, ver in entries:
+        op = _RPM_FLAG_TO_OP.get(flags, "")
+        version = sanitize_version(ver) if (op and ver) else ""
+        if not op or not version:
+            op, version = "", ""
+        groups.append([(sanitize_name(name), op, version)])
+    return groups
+
+
+def format_dep_field(groups):
+    """Serializes parse_dep_field()'s output back to the .info textual
+    form: comma-separated OR-groups, pipe-separated alternatives,
+    "name (OPversion)" per alternative that carries a constraint."""
+    parts = []
+    for group in groups:
+        alt_strs = []
+        for name, op, ver in group:
+            alt_strs.append(f"{name} ({op}{ver})" if op and ver else name)
+        parts.append("|".join(alt_strs))
+    return ",".join(parts)
+
+
+def provides_names(groups):
+    """Flat list of every real name mentioned across all OR-groups --
+    Provides fields don't have meaningful alternation, this is just used to
+    build the flat virtual-name list for a package's `provides=` line and
+    for populating the cross-package provides index."""
+    return [alt[0] for group in groups for alt in group]
+
+
 # Reverse-parses a .wsh index line back into its package name. Anchored from
 # the right (version/release/arch are all tightly constrained patterns) so
 # this is reliable even for names that themselves contain digits or dashes.
@@ -193,3 +274,40 @@ def merge_index(arch, distro, own_index_path, state_dir, num_shards, shard):
     with open(merged_path, "w") as f:
         f.writelines(f"{l}\n" for l in sorted(lines))
     b2_cp(merged_path, f"index/{arch}.txt")
+
+
+def provides_shard_key(distro, arch, shard):
+    return f"index/{arch}/{distro}-shard{shard}-provides.txt"
+
+
+def merge_provides(arch, distro, own_provides_path, state_dir, num_shards, shard):
+    """Same union-and-republish shape as merge_index(), for the separate
+    virtual-name -> real-package-name mapping. Kept as its own small file
+    (index/<arch>-provides.txt, "virtual_name real_name" per line) instead
+    of folded into the main package list, because the resolver only needs
+    to fetch it ONCE per run (not per-package) to resolve a dependency on a
+    virtual/provided name -- that's the whole point of not re-introducing
+    the eager-full-catalog-fetch performance bug fixed earlier."""
+    lines = set()
+    if os.path.exists(own_provides_path):
+        with open(own_provides_path) as f:
+            lines.update(l.strip() for l in f if l.strip())
+
+    current = os.path.join(state_dir, f"current-{arch}.provides")
+    if b2_get(f"index/{arch}-provides.txt", current):
+        with open(current) as f:
+            lines.update(l.strip() for l in f if l.strip())
+
+    for d, count in DISTRO_SHARD_COUNTS.items():
+        for s in range(count):
+            if d == distro and s == shard:
+                continue
+            tmp = os.path.join(state_dir, f"other-{arch}-{d}-shard{s}.provides")
+            if b2_get(provides_shard_key(d, arch, s), tmp):
+                with open(tmp) as f:
+                    lines.update(l.strip() for l in f if l.strip())
+
+    merged_path = os.path.join(state_dir, f"{arch}.merged.provides")
+    with open(merged_path, "w") as f:
+        f.writelines(f"{l}\n" for l in sorted(lines))
+    b2_cp(merged_path, f"index/{arch}-provides.txt")

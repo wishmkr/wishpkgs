@@ -43,6 +43,12 @@ import tempfile
 import time
 from urllib.request import urlopen
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mirror_common import (
+    parse_dep_field, format_dep_field, provides_names,
+    merge_provides, provides_shard_key,
+)
+
 DEADLINE = time.monotonic() + float(os.environ.get("MIRROR_DEADLINE_SECONDS", "19500"))
 RELEASE = os.environ.get("MIRROR_RELEASE", "noble")
 COMPONENTS = [c for c in os.environ.get("MIRROR_COMPONENTS", "main").split(",") if c]
@@ -130,19 +136,11 @@ def sanitize_version(raw):
 
 
 def sanitize_depends(field):
-    if not field:
-        return []
-    out, seen = [], set()
-    for group in field.split(","):
-        first = group.strip().split("|", 1)[0].strip()
-        name = re.split(r"[\s(]", first, 1)[0].strip()
-        if not name:
-            continue
-        dep = sanitize_name(name)
-        if dep not in seen:
-            seen.add(dep)
-            out.append(dep)
-    return out
+    """Preserves version constraints and OR-alternatives now (previously
+    dropped both -- e.g. "foo (>= 1.2) | bar" became just "foo"). Returns
+    the .info-ready textual form directly; see mirror_common.parse_dep_field
+    for the structure this round-trips through."""
+    return format_dep_field(parse_dep_field(field))
 
 
 def parse_packages(text):
@@ -185,12 +183,14 @@ def load_state_set(key):
 
 
 def process_package(arch_wish, base, pkg, workdir):
-    """Downloads, repackages, and uploads one package. Returns the .wsh
-    filename on success, or None on failure -- the caller owns index/state
-    bookkeeping (this function only touches pkgs/<arch>/ in B2)."""
+    """Downloads, repackages, and uploads one package. Returns
+    (wsh_filename, provides_list) on success, or (None, []) on failure --
+    the caller owns index/state bookkeeping (this function only touches
+    pkgs/<arch>/ in B2). provides_list feeds the caller's cross-package
+    provides-index accumulation."""
     name_raw, ver_raw, filename = pkg.get("Package"), pkg.get("Version"), pkg.get("Filename")
     if not (name_raw and ver_raw and filename):
-        return None
+        return None, []
 
     name = sanitize_name(name_raw)
     version = sanitize_version(ver_raw)
@@ -221,21 +221,32 @@ def process_package(arch_wish, base, pkg, workdir):
             f.write(f"{sha}  {wsh_name}\n")
 
         depends = sanitize_depends(pkg.get("Depends", ""))
+        conflicts = sanitize_depends(pkg.get("Conflicts", ""))
+        breaks = sanitize_depends(pkg.get("Breaks", ""))
+        provides_groups = parse_dep_field(pkg.get("Provides", ""))
+        provides = provides_names(provides_groups)
+
         desc_line = pkg.get("Description", "").splitlines()[0] if pkg.get("Description") else ""
         info_path = os.path.join(workdir, f"{name}.info")
         with open(info_path, "w") as f:
             f.write(f"description={redact(desc_line)}\n")
             f.write("license=See included license/copyright files\n")
             if depends:
-                f.write(f"depends={','.join(depends)}\n")
+                f.write(f"depends={depends}\n")
+            if provides:
+                f.write(f"provides={','.join(provides)}\n")
+            if conflicts:
+                f.write(f"conflicts={conflicts}\n")
+            if breaks:
+                f.write(f"breaks={breaks}\n")
 
         b2_cp(wsh_path, f"pkgs/{arch_wish}/{wsh_name}")
         b2_cp(sha_path, f"pkgs/{arch_wish}/{wsh_name}.sha256")
         b2_cp(info_path, f"pkgs/{arch_wish}/{name}.info")
-        return wsh_name
+        return wsh_name, [(v, name) for v in provides]
     except Exception as e:
         print(f"FAILED {name_raw}={ver_raw}: {e}", file=sys.stderr)
-        return None
+        return None, []
     finally:
         if os.path.exists(deb_path):
             os.remove(deb_path)
@@ -330,24 +341,34 @@ def mirror_arch(arch_wish, state_dir):
     workdir = os.path.join(state_dir, "work")
     os.makedirs(workdir, exist_ok=True)
 
+    provides_path = os.path.join(state_dir, "provides")
+    provides_key = provides_shard_key("ubuntu", arch_wish, SHARD) if tag else f"index/{arch_wish}-provides.txt"
+
     def flush():
         b2_cp(done_path, done_key)
         b2_cp(failed_path, failed_key)
         b2_cp(index_path, index_key)
+        if os.path.exists(provides_path):
+            b2_cp(provides_path, provides_key)
         if NUM_SHARDS > 1:
             merge_index(arch_wish, index_path, state_dir)
+            merge_provides(arch_wish, "ubuntu", provides_path, state_dir, NUM_SHARDS, SHARD)
 
     processed = 0
     for uid, pkg in todo:
         if time.monotonic() > DEADLINE:
             print("deadline reached, stopping cleanly", file=sys.stderr)
             break
-        wsh_name = process_package(arch_wish, base, pkg, workdir)
+        wsh_name, provides = process_package(arch_wish, base, pkg, workdir)
         if wsh_name:
             with open(done_path, "a") as f:
                 f.write(uid + "\n")
             with open(index_path, "a") as f:
                 f.write(wsh_name + "\n")
+            if provides:
+                with open(provides_path, "a") as f:
+                    for virtual_name, real_name in provides:
+                        f.write(f"{virtual_name} {real_name}\n")
         else:
             with open(failed_path, "a") as f:
                 f.write(uid + "\n")

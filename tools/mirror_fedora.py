@@ -32,7 +32,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mirror_common import (
     sh, b2_cp, b2_get, is_blocked, in_shard, redact, sanitize_name,
     sanitize_version, sanitize_depends_list, load_state_set,
-    load_canonical_names, merge_index,
+    load_canonical_names, merge_index, rpm_entries_to_groups,
+    format_dep_field, provides_names, merge_provides, provides_shard_key,
 )
 
 DISTRO = "fedora"
@@ -119,6 +120,22 @@ def fetch_primary_xml(rpm_arch):
 _PLAIN_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
 
 
+def _read_entries(container):
+    """<rpm:entry name=".." flags=".." ver=".."/> tuples, skipping rpmlib(...)
+    feature markers and soname-style "libfoo.so.N()(64bit)" virtual entries
+    (parenthesized names) that don't map onto any real installable
+    package."""
+    out = []
+    if container is None:
+        return out
+    for entry in container.findall("rpm:entry", NS):
+        rname = entry.get("name", "")
+        if rname.startswith("rpmlib(") or not _PLAIN_NAME_RE.match(rname):
+            continue
+        out.append((rname, entry.get("flags", ""), entry.get("ver", "")))
+    return out
+
+
 def parse_primary(xml_bytes):
     root = ET.fromstring(xml_bytes)
     for pkg in root.findall("common:package", NS):
@@ -134,16 +151,12 @@ def parse_primary(xml_bytes):
         href = location_el.get("href") if location_el is not None else None
         summary = pkg.findtext("common:summary", default="", namespaces=NS)
 
-        requires = []
+        requires, provides, conflicts = [], [], []
         fmt = pkg.find("common:format", NS)
         if fmt is not None:
-            req_container = fmt.find("rpm:requires", NS)
-            if req_container is not None:
-                for entry in req_container.findall("rpm:entry", NS):
-                    rname = entry.get("name", "")
-                    if rname.startswith("rpmlib(") or not _PLAIN_NAME_RE.match(rname):
-                        continue
-                    requires.append(rname)
+            requires = _read_entries(fmt.find("rpm:requires", NS))
+            provides = _read_entries(fmt.find("rpm:provides", NS))
+            conflicts = _read_entries(fmt.find("rpm:conflicts", NS))
 
         if not (name and version and href):
             continue
@@ -153,6 +166,8 @@ def parse_primary(xml_bytes):
             "href": href,
             "summary": summary,
             "requires": requires,
+            "provides": provides,
+            "conflicts": conflicts,
         }
 
 
@@ -189,22 +204,30 @@ def process_package(arch_wish, rpm_arch, pkg, workdir):
         with open(sha_path, "w") as f:
             f.write(f"{sha}  {wsh_name}\n")
 
-        depends = sanitize_depends_list(pkg["requires"])
+        depends = format_dep_field(rpm_entries_to_groups(pkg["requires"]))
+        conflicts = format_dep_field(rpm_entries_to_groups(pkg["conflicts"]))
+        provides_groups = rpm_entries_to_groups(pkg["provides"])
+        provides = provides_names(provides_groups)
+
         desc_line = pkg["summary"].splitlines()[0] if pkg["summary"] else ""
         info_path = os.path.join(workdir, f"{name}.info")
         with open(info_path, "w") as f:
             f.write(f"description={redact(desc_line)}\n")
             f.write("license=See included license/copyright files\n")
             if depends:
-                f.write(f"depends={','.join(depends)}\n")
+                f.write(f"depends={depends}\n")
+            if provides:
+                f.write(f"provides={','.join(provides)}\n")
+            if conflicts:
+                f.write(f"conflicts={conflicts}\n")
 
         b2_cp(wsh_path, f"pkgs/{arch_wish}/{wsh_name}")
         b2_cp(sha_path, f"pkgs/{arch_wish}/{wsh_name}.sha256")
         b2_cp(info_path, f"pkgs/{arch_wish}/{name}.info")
-        return wsh_name
+        return wsh_name, [(v, name) for v in provides]
     except Exception as e:
         print(f"FAILED {name_raw}={ver_raw}: {e}", file=sys.stderr)
-        return None
+        return None, []
     finally:
         if os.path.exists(rpm_path):
             os.remove(rpm_path)
@@ -258,24 +281,32 @@ def mirror_arch(arch_wish, state_dir):
 
     workdir = os.path.join(state_dir, "work")
     os.makedirs(workdir, exist_ok=True)
+    provides_path = os.path.join(state_dir, "provides")
 
     def flush():
         b2_cp(done_path, done_key)
         b2_cp(failed_path, failed_key)
         b2_cp(index_path, index_key)
         merge_index(arch_wish, DISTRO, index_path, state_dir, NUM_SHARDS, SHARD)
+        if os.path.exists(provides_path):
+            b2_cp(provides_path, provides_shard_key(DISTRO, arch_wish, SHARD))
+        merge_provides(arch_wish, DISTRO, provides_path, state_dir, NUM_SHARDS, SHARD)
 
     processed = 0
     for uid, pkg in todo:
         if time.monotonic() > DEADLINE:
             print("deadline reached, stopping cleanly", file=sys.stderr)
             break
-        wsh_name = process_package(arch_wish, rpm_arch, pkg, workdir)
+        wsh_name, provides = process_package(arch_wish, rpm_arch, pkg, workdir)
         if wsh_name:
             with open(done_path, "a") as f:
                 f.write(uid + "\n")
             with open(index_path, "a") as f:
                 f.write(wsh_name + "\n")
+            if provides:
+                with open(provides_path, "a") as f:
+                    for virtual_name, real_name in provides:
+                        f.write(f"{virtual_name} {real_name}\n")
         else:
             with open(failed_path, "a") as f:
                 f.write(uid + "\n")

@@ -62,9 +62,9 @@ def try_ubuntu(wanted, arch_wish, workdir):
             sanitized = sanitize_name(name_raw)
             if sanitized not in wanted:
                 continue
-            wsh = mirror_ubuntu.process_package(arch_wish, cfg["base"], pkg, workdir)
+            wsh, provides = mirror_ubuntu.process_package(arch_wish, cfg["base"], pkg, workdir)
             if wsh:
-                healed[sanitized] = ("ubuntu", wsh)
+                healed[sanitized] = ("ubuntu", wsh, provides)
                 wanted.discard(sanitized)
                 print(f"healed via ubuntu/{comp}: {sanitized} -> {wsh}", file=sys.stderr)
     return healed
@@ -91,9 +91,9 @@ def try_debian(wanted, arch_wish, workdir):
             sanitized = sanitize_name(name_raw)
             if sanitized not in wanted:
                 continue
-            wsh = mirror_debian.process_package(arch_wish, cfg["base"], pkg, workdir)
+            wsh, provides = mirror_debian.process_package(arch_wish, cfg["base"], pkg, workdir)
             if wsh:
-                healed[sanitized] = ("debian", wsh)
+                healed[sanitized] = ("debian", wsh, provides)
                 wanted.discard(sanitized)
                 print(f"healed via debian/{comp}: {sanitized} -> {wsh}", file=sys.stderr)
     return healed
@@ -119,9 +119,9 @@ def try_fedora(wanted, arch_wish, workdir):
         sanitized = sanitize_name(name_raw)
         if sanitized not in wanted:
             continue
-        wsh = mirror_fedora.process_package(arch_wish, rpm_arch, pkg, workdir)
+        wsh, provides = mirror_fedora.process_package(arch_wish, rpm_arch, pkg, workdir)
         if wsh:
-            healed[sanitized] = ("fedora", wsh)
+            healed[sanitized] = ("fedora", wsh, provides)
             wanted.discard(sanitized)
             print(f"healed via fedora: {sanitized} -> {wsh}", file=sys.stderr)
     return healed
@@ -149,6 +149,27 @@ def publish_healed(arch, wsh_names):
     os.remove(out)
 
 
+def publish_provides(arch, provides_pairs):
+    """Same read-union-write as publish_healed(), for the newly-healed
+    packages' own `provides=` declarations -- without this, a package heal
+    just mirrored in would never show up as a virtual-package provider
+    until some later mirror/heal run happened to touch it again."""
+    if not provides_pairs:
+        return
+    tmp = tempfile.mktemp()
+    lines = set()
+    if b2_get(f"index/{arch}-provides.txt", tmp):
+        with open(tmp) as f:
+            lines.update(l.strip() for l in f if l.strip())
+        os.remove(tmp)
+    lines.update(f"{v} {r}" for v, r in provides_pairs)
+    out = tempfile.mktemp()
+    with open(out, "w") as f:
+        f.writelines(f"{l}\n" for l in sorted(lines))
+    b2_cp(out, f"index/{arch}-provides.txt")
+    os.remove(out)
+
+
 def heal_arch(arch, names_file, workdir):
     with open(names_file) as f:
         all_names = {l.strip() for l in f if l.strip()}
@@ -167,11 +188,13 @@ def heal_arch(arch, names_file, workdir):
         found = try_fn(wanted, arch, workdir)
         all_healed.update(found)
 
-    publish_healed(arch, [wsh for _, wsh in all_healed.values()])
+    publish_healed(arch, [wsh for _, wsh, _ in all_healed.values()])
+    all_provides = [pair for _, _, provides in all_healed.values() for pair in provides]
+    publish_provides(arch, all_provides)
 
     report = {
         name: {"status": "healed", "source": src, "file": wsh}
-        for name, (src, wsh) in all_healed.items()
+        for name, (src, wsh, _provides) in all_healed.items()
     }
     for name in wanted:
         report[name] = {"status": "not_found_anywhere"}
