@@ -109,12 +109,14 @@ def scan_ubuntu_stanzas(arch_wish):
     for comp in UBUNTU_COMPONENTS:
         if deadline_hit():
             break
+        print(f"[scan] ubuntu/{comp} ({arch_wish}): fetching index...", file=sys.stderr, flush=True)
         try:
             text = mirror_ubuntu.fetch_packages_index(
                 cfg["base"], mirror_ubuntu.RELEASE, comp, cfg["deb_arch"])
         except Exception as e:
-            print(f"ubuntu/{comp}: fetch failed: {e}", file=sys.stderr)
+            print(f"ubuntu/{comp}: fetch failed: {e}", file=sys.stderr, flush=True)
             continue
+        before = len(out)
         for pkg in mirror_ubuntu.parse_packages(text):
             name_raw, ver_raw = pkg.get("Package"), pkg.get("Version")
             if not name_raw or not ver_raw or is_blocked(name_raw):
@@ -127,6 +129,8 @@ def scan_ubuntu_stanzas(arch_wish):
                 sanitized_version=sanitize_version(ver_raw), raw=pkg,
                 wish_arch=arch_wish, upstream_filename=pkg.get("Filename"),
             ))
+        print(f"[scan] ubuntu/{comp} ({arch_wish}): {len(out) - before} stanzas "
+              f"({len(out)} total so far)", file=sys.stderr, flush=True)
     return out
 
 
@@ -136,12 +140,14 @@ def scan_debian_stanzas(arch_wish):
     for comp in DEBIAN_COMPONENTS:
         if deadline_hit():
             break
+        print(f"[scan] debian/{comp} ({arch_wish}): fetching index...", file=sys.stderr, flush=True)
         try:
             text = mirror_debian.fetch_packages_index(
                 cfg["base"], mirror_debian.RELEASE, comp, cfg["deb_arch"])
         except Exception as e:
-            print(f"debian/{comp}: fetch failed: {e}", file=sys.stderr)
+            print(f"debian/{comp}: fetch failed: {e}", file=sys.stderr, flush=True)
             continue
+        before = len(out)
         for pkg in mirror_debian.parse_packages(text):
             name_raw, ver_raw = pkg.get("Package"), pkg.get("Version")
             if not name_raw or not ver_raw or is_blocked(name_raw):
@@ -154,16 +160,19 @@ def scan_debian_stanzas(arch_wish):
                 sanitized_version=sanitize_version(ver_raw), raw=pkg,
                 wish_arch=arch_wish, upstream_filename=pkg.get("Filename"),
             ))
+        print(f"[scan] debian/{comp} ({arch_wish}): {len(out) - before} stanzas "
+              f"({len(out)} total so far)", file=sys.stderr, flush=True)
     return out
 
 
 def scan_fedora_stanzas(arch_wish):
     cfg = mirror_fedora.ARCHES[arch_wish]
     out = []
+    print(f"[scan] fedora ({arch_wish}): fetching primary.xml...", file=sys.stderr, flush=True)
     try:
         xml = mirror_fedora.fetch_primary_xml(cfg["rpm_arch"])
     except Exception as e:
-        print(f"fedora: fetch failed: {e}", file=sys.stderr)
+        print(f"fedora: fetch failed: {e}", file=sys.stderr, flush=True)
         return out
     for pkg in mirror_fedora.parse_primary(xml):
         name_raw = pkg["name"]
@@ -177,6 +186,7 @@ def scan_fedora_stanzas(arch_wish):
             sanitized_version=sanitize_version(pkg["version"]), raw=pkg,
             wish_arch=arch_wish, upstream_filename=pkg.get("href"),
         ))
+    print(f"[scan] fedora ({arch_wish}): {len(out)} stanzas", file=sys.stderr, flush=True)
     return out
 
 
@@ -185,6 +195,8 @@ def scan_all_stanzas(arch_wish):
     stanzas.extend(scan_ubuntu_stanzas(arch_wish))
     stanzas.extend(scan_debian_stanzas(arch_wish))
     stanzas.extend(scan_fedora_stanzas(arch_wish))
+    print(f"[scan] {arch_wish}: {len(stanzas)} total upstream stanzas scanned",
+          file=sys.stderr, flush=True)
     return stanzas
 
 
@@ -340,18 +352,43 @@ class CatalogRebuild:
         self.report[bucket][distro] = self.report[bucket].get(distro, 0) + 1
 
     def run(self):
+        t_start = time.monotonic()
         canonical_versions = load_canonical_versions(self.arch, self.workdir)
         self.canonical_versions = canonical_versions
         canonical_names = set(canonical_versions)
-        print(f"{len(canonical_names)} canonical packages for {self.arch}", file=sys.stderr)
+        print(f"[run] {len(canonical_names)} canonical packages for {self.arch}",
+              file=sys.stderr, flush=True)
 
         stanzas = scan_all_stanzas(self.arch)
-        print(f"{len(stanzas)} upstream stanzas scanned for {self.arch}", file=sys.stderr)
 
+        print(f"[run] loading prior provenance manifest for {self.arch}...",
+              file=sys.stderr, flush=True)
         self.prior_manifest = load_provenance_manifest(self.arch, self.workdir)
-        manifest = build_provenance_manifest(canonical_versions, stanzas, self.arch)
+        print(f"[run] {len(self.prior_manifest)} prior provenance records loaded",
+              file=sys.stderr, flush=True)
 
+        manifest = build_provenance_manifest(canonical_versions, stanzas, self.arch)
+        print(f"[run] matching {len(manifest)} canonical packages against "
+              f"{len(stanzas)} upstream stanzas -- this does one or two B2 GETs "
+              f"per RESOLVED package (current .info + live .wsh.sha256), so it "
+              f"is the slowest phase", file=sys.stderr, flush=True)
+
+        processed = 0
         for name, result in manifest.items():
+            processed += 1
+            if processed % 250 == 0:
+                elapsed = time.monotonic() - t_start
+                rate = processed / elapsed if elapsed > 0 else 0
+                remaining = len(manifest) - processed
+                eta_s = remaining / rate if rate > 0 else float("inf")
+                print(f"[run] {self.arch}: {processed}/{len(manifest)} matched "
+                      f"({elapsed:.0f}s elapsed, {rate:.1f} pkg/s, "
+                      f"~{eta_s / 60:.0f}min remaining) -- "
+                      f"repaired={sum(self.report['repaired'].values())} "
+                      f"unchanged={sum(self.report['unchanged'].values())} "
+                      f"unresolved={sum(self.report['unresolved'].values())} "
+                      f"ambiguous={sum(self.report['ambiguous'].values())}",
+                      file=sys.stderr, flush=True)
             if result.status == ProvenanceResult.UNRESOLVED:
                 self._bump("unresolved", "unknown")
                 continue
@@ -384,11 +421,25 @@ class CatalogRebuild:
                 self._bump("repaired", stanza.source_distro)
                 self.staged_info[name] = new_info
 
+        elapsed = time.monotonic() - t_start
+        print(f"[run] {self.arch}: matching pass done ({processed} packages, "
+              f"{elapsed:.0f}s) -- repaired={sum(self.report['repaired'].values())} "
+              f"unchanged={sum(self.report['unchanged'].values())} "
+              f"unresolved={sum(self.report['unresolved'].values())} "
+              f"ambiguous={sum(self.report['ambiguous'].values())}",
+              file=sys.stderr, flush=True)
+
         # Step 4: rebuild provides index from ALL staged info (repaired +
         # unchanged) -- packages that stayed unresolved/ambiguous keep
         # whatever provides they already had live (we never touched them),
         # so fold those in too, unless they don't even have a live .info.
-        for name in canonical_names:
+        print(f"[run] {self.arch}: rebuilding provides index from "
+              f"{len(canonical_names)} canonical packages' metadata...",
+              file=sys.stderr, flush=True)
+        for i, name in enumerate(canonical_names, 1):
+            if i % 2000 == 0:
+                print(f"[run] {self.arch}: provides scan {i}/{len(canonical_names)}",
+                      file=sys.stderr, flush=True)
             if name in self.staged_info:
                 text = self.staged_info[name]
             else:
@@ -397,6 +448,8 @@ class CatalogRebuild:
                     continue
             for virtual in parse_info_provides(text):
                 self.provides_index.setdefault(virtual, set()).add(name)
+        print(f"[run] {self.arch}: provides index has {len(self.provides_index)} "
+              f"virtual names", file=sys.stderr, flush=True)
 
         # Step 8: every provides target must be canonical.
         bad_provides = {v: r for v, r in self.provides_index.items()
@@ -406,10 +459,18 @@ class CatalogRebuild:
             del self.provides_index[virtual]
 
         # Step 9: classify every literal dependency across all staged info.
+        print(f"[run] {self.arch}: classifying dependencies...", file=sys.stderr, flush=True)
         dep_report = self._validate_dependencies(canonical_names)
+        print(f"[run] {self.arch}: dependency classes: "
+              f"literal={dep_report['literal']} virtual={dep_report['virtual']} "
+              f"excluded={dep_report['excluded']} unresolved={dep_report['unresolved']}",
+              file=sys.stderr, flush=True)
 
         # Step 7: orphan sweep.
+        print(f"[run] {self.arch}: sweeping for orphan objects...", file=sys.stderr, flush=True)
         orphans = self._find_orphans(canonical_names)
+        print(f"[run] {self.arch}: {len(orphans)} orphan object(s) found",
+              file=sys.stderr, flush=True)
         for _ in orphans:
             self._bump("orphaned", "unknown")
 

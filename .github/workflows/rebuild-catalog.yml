@@ -36,6 +36,14 @@ env:
   REBUILD_DEADLINE_SECONDS: "19500"
   REBUILD_COMPONENTS_UBUNTU: "main,universe,multiverse,restricted"
   REBUILD_COMPONENTS_DEBIAN: "main,contrib,non-free-firmware"
+  # Belt-and-suspenders alongside this script's own flush=True prints:
+  # Python defaults to fully block-buffered stdout/stderr when not
+  # attached to a real TTY (i.e. always, under GitHub Actions), so
+  # without this, log lines can sit in an in-process buffer for a long
+  # time before ever reaching the Actions log stream -- which is exactly
+  # what made an earlier run of this workflow look silent/possibly-hung
+  # for hours even though it was making real progress.
+  PYTHONUNBUFFERED: "1"
 
 jobs:
   rebuild:
