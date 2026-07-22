@@ -447,5 +447,140 @@ class ContinuityVerificationTests(unittest.TestCase):
         self.assertFalse(report["published"])
 
 
+class BootstrapLiveInfoMatchTests(unittest.TestCase):
+    """The bootstrap disambiguation mechanism: an ambiguous name+version
+    match may still be accepted if EXACTLY ONE candidate's freshly
+    rendered .info is byte-identical to what's already live -- and only
+    ever recorded at CONFIDENCE_BOOTSTRAP, never verified."""
+
+    def _ambiguous_pair(self, ubuntu_desc="same content", debian_desc="same content"):
+        u = stanza("ubuntu", "noble", "arm64", "main", "shared-pkg", "1.0-1ubuntu1",
+                   raw={"Package": "shared-pkg", "Version": "1.0-1ubuntu1",
+                        "Depends": "", "Provides": "", "Conflicts": "", "Breaks": "",
+                        "Description": ubuntu_desc})
+        d = stanza("debian", "bookworm", "arm64", "main", "shared-pkg", "1.0-1",
+                   raw={"Package": "shared-pkg", "Version": "1.0-1",
+                        "Depends": "", "Provides": "", "Conflicts": "", "Breaks": "",
+                        "Description": debian_desc})
+        return u, d
+
+    def test_unique_content_match_is_accepted_as_bootstrap(self):
+        u, d = self._ambiguous_pair(ubuntu_desc="the real content")
+        live_info = rc.render_info_from_stanza(u)  # matches Ubuntu's rendering only
+
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: live_info
+        rebuild._find_orphans = lambda names: []
+
+        report = rebuild.run()
+
+        self.assertEqual(sum(report["ambiguous"].values()), 0)
+        self.assertEqual(sum(report["bootstrap_matched"].values()), 1)
+        self.assertIn("shared-pkg", rebuild.staged_info)
+        record = rebuild.new_manifest["shared-pkg"]
+        self.assertEqual(record.confidence, rc.ProvenanceRecord.CONFIDENCE_BOOTSTRAP)
+        self.assertNotEqual(record.confidence, rc.ProvenanceRecord.CONFIDENCE_VERIFIED)
+        self.assertEqual(record.source_distro, "ubuntu")
+
+    def test_no_content_match_stays_ambiguous(self):
+        u, d = self._ambiguous_pair()
+        live_info = "description=neither candidate wrote this\nlicense=x\n"
+
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: live_info
+        rebuild._find_orphans = lambda names: []
+
+        report = rebuild.run()
+
+        self.assertEqual(sum(report["bootstrap_matched"].values()), 0)
+        self.assertEqual(sum(report["ambiguous"].values()), 1)
+        self.assertNotIn("shared-pkg", rebuild.staged_info)
+
+    def test_both_candidates_matching_identically_stays_ambiguous(self):
+        # Identical rendered content from BOTH candidates (e.g. genuinely
+        # identical packaging) -- multiple matches, never guess between them.
+        u, d = self._ambiguous_pair(ubuntu_desc="same", debian_desc="same")
+        live_info = rc.render_info_from_stanza(u)  # == render(d) too, by construction
+
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: live_info
+        rebuild._find_orphans = lambda names: []
+
+        report = rebuild.run()
+
+        self.assertEqual(sum(report["bootstrap_matched"].values()), 0)
+        self.assertEqual(sum(report["ambiguous"].values()), 1)
+
+    def test_excluded_package_never_bootstrap_matched_even_with_unique_content_match(self):
+        u, d = self._ambiguous_pair(ubuntu_desc="the real content")
+        live_info = rc.render_info_from_stanza(u)
+
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: live_info
+        rebuild._find_orphans = lambda names: []
+        rebuild._load_bootstrap_exclusions = lambda: {"shared-pkg"}
+
+        report = rebuild.run()
+
+        self.assertEqual(sum(report["bootstrap_matched"].values()), 0)
+        self.assertEqual(sum(report["ambiguous"].values()), 1)
+
+    def test_contamination_order_heuristic_rejects_suspicious_match(self):
+        # Debian matches live content, but Ubuntu (earlier in
+        # HISTORICAL_BACKFILL_ORDER) is ALSO a candidate that doesn't
+        # match -- this is exactly the shape the historical "later distro
+        # silently overwrote an earlier one" bug would produce, so it must
+        # be rejected even though the name+content match is otherwise clean.
+        u, d = self._ambiguous_pair(ubuntu_desc="alpha variant", debian_desc="beta variant")
+        live_info = rc.render_info_from_stanza(d)  # only matches Debian
+
+        matched, confidence = rc.try_bootstrap_match(
+            "shared-pkg", [u, d], live_info, set(), rc.render_info_from_stanza)
+        self.assertIsNone(matched)
+        self.assertIsNone(confidence)
+
+    def test_contamination_order_heuristic_allows_earliest_distro_match(self):
+        # Symmetric case: Ubuntu (earliest in the order) is the one that
+        # matches -- nothing "later" could have overwritten it, so this is
+        # legitimate and must be accepted.
+        u, d = self._ambiguous_pair(ubuntu_desc="alpha variant", debian_desc="beta variant")
+        live_info = rc.render_info_from_stanza(u)  # only matches Ubuntu
+
+        matched, confidence = rc.try_bootstrap_match(
+            "shared-pkg", [u, d], live_info, set(), rc.render_info_from_stanza)
+        self.assertIs(matched, u)
+        self.assertEqual(confidence, rc.ProvenanceRecord.CONFIDENCE_BOOTSTRAP)
+
+    def test_bootstrap_match_does_not_block_publish(self):
+        # The whole point of bootstrap matching is to let an otherwise-
+        # fully-clean catalog publish despite genuine cross-distro
+        # name+version collisions -- a bootstrap-tier record must not
+        # itself count as a blocker.
+        u, d = self._ambiguous_pair(ubuntu_desc="the real content")
+        live_info = rc.render_info_from_stanza(u)
+
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=True)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: live_info
+        rebuild._find_orphans = lambda names: []
+        published_calls = []
+        rebuild._publish = lambda orphans: published_calls.append(orphans)
+
+        report = rebuild.run()
+
+        self.assertEqual(report["publish_blockers"], [])
+        self.assertTrue(report["published"])
+        self.assertEqual(len(published_calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

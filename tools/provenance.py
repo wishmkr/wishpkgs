@@ -38,15 +38,30 @@ class ProvenanceRecord:
     """The exact upstream source that produced one canonical package's
     published .wsh -- what its .info may legally be regenerated from."""
 
+    # A record's confidence tier -- NEVER conflate these. "verified" means
+    # match_provenance found exactly one upstream stanza by name+version
+    # (optionally strengthened by verify_continuity against prior history).
+    # "bootstrap_live_info_match" means the name+version match was
+    # genuinely ambiguous (2+ distinct upstream sources), and was ONLY
+    # accepted because exactly one candidate's freshly-rendered .info was
+    # byte-identical to what's already live -- corroborating evidence, not
+    # proof of which upstream source actually produced the payload. A
+    # future run with stronger evidence (e.g. this same package resolving
+    # unambiguously once upstream versions diverge) should upgrade a
+    # bootstrap record to verified, never the reverse.
+    CONFIDENCE_VERIFIED = "verified"
+    CONFIDENCE_BOOTSTRAP = "bootstrap_live_info_match"
+
     __slots__ = (
         "name", "arch", "source_distro", "suite", "source_arch",
         "component", "upstream_name", "upstream_version", "wsh_filename",
-        "payload_sha256", "upstream_filename",
+        "payload_sha256", "upstream_filename", "confidence",
     )
 
     def __init__(self, name, arch, source_distro, suite, source_arch,
                  component, upstream_name, upstream_version, wsh_filename,
-                 payload_sha256=None, upstream_filename=None):
+                 payload_sha256=None, upstream_filename=None,
+                 confidence=CONFIDENCE_VERIFIED):
         self.name = name
         self.arch = arch
         self.source_distro = source_distro
@@ -58,6 +73,7 @@ class ProvenanceRecord:
         self.wsh_filename = wsh_filename
         self.payload_sha256 = payload_sha256
         self.upstream_filename = upstream_filename
+        self.confidence = confidence
 
     def to_dict(self):
         return {k: getattr(self, k) for k in self.__slots__}
@@ -242,6 +258,80 @@ def verify_continuity(stanza, prior_record, live_payload_sha256):
         if prior_record.payload_sha256 != live_payload_sha256:
             return False
     return True
+
+
+# The distro processing order backfill_metadata.py used BEFORE the
+# cross-distro version-guard fix (ubuntu, debian, fedora) -- the exact
+# order whose "last write wins" bug let Debian's libgcc-s1 silently
+# overwrite Ubuntu's. A bootstrap content match landing on a distro that
+# comes AFTER another candidate in this order is indistinguishable from
+# what that historical bug would have produced (the live .info could be
+# "correct" simply because the buggy backfill already overwrote it with
+# that later distro's content) -- such matches are never trusted via
+# bootstrap, see is_suspicious_contamination_order.
+HISTORICAL_BACKFILL_ORDER = ["ubuntu", "debian", "fedora"]
+
+
+def is_suspicious_contamination_order(matched_stanza, all_candidates):
+    """True if some OTHER candidate for the same ambiguous package comes
+    EARLIER than `matched_stanza` in HISTORICAL_BACKFILL_ORDER. A distro
+    unknown to that order is never considered "earlier" than anything (no
+    known bug pattern applies to it)."""
+    def rank(distro):
+        try:
+            return HISTORICAL_BACKFILL_ORDER.index(distro)
+        except ValueError:
+            return -1
+    matched_rank = rank(matched_stanza.source_distro)
+    if matched_rank == -1:
+        return False
+    for c in all_candidates:
+        if c is matched_stanza:
+            continue
+        other_rank = rank(c.source_distro)
+        if other_rank != -1 and other_rank < matched_rank:
+            return True
+    return False
+
+
+def try_bootstrap_match(name, candidates, live_info_text, excluded_names,
+                         render_fn):
+    """Attempts to disambiguate an AMBIGUOUS provenance match (see
+    match_provenance) using byte-for-byte comparison against the
+    currently-published .info -- NOT a guess: corroborating evidence, not
+    proof. Only ever used as a BOOTSTRAP mechanism (no prior trusted
+    manifest exists yet to check continuity against via verify_continuity)
+    -- once a package resolves unambiguously on a later run (e.g. upstream
+    versions have since diverged), the normal verified path takes over and
+    this is never consulted again for it.
+
+    Compares ALL semantic fields (description/license/depends/provides/
+    conflicts/breaks) via `render_fn` (the same rendering every candidate
+    would use to actually regenerate its .info), not dependencies alone.
+
+    Accepts a candidate only when:
+      - the package name isn't in `excluded_names` (known-contaminated or
+        manually-repaired packages, whose live .info might itself be
+        exactly the kind of content a bootstrap match would wrongly trust
+        -- see CatalogRebuild._load_bootstrap_exclusions),
+      - `live_info_text` exists (nothing to corroborate against otherwise),
+      - EXACTLY ONE candidate's rendered .info matches live_info_text
+        (normalized: trailing whitespace stripped on both sides) -- zero
+        or multiple matches both stay ambiguous, never guessed between,
+      - the match isn't flagged by is_suspicious_contamination_order.
+
+    Returns (stanza, ProvenanceRecord.CONFIDENCE_BOOTSTRAP) on acceptance,
+    or (None, None) otherwise."""
+    if name in excluded_names or live_info_text is None:
+        return None, None
+    normalized_live = live_info_text.strip()
+    matches = [c for c in candidates if render_fn(c).strip() == normalized_live]
+    if len(matches) != 1:
+        return None, None
+    matched = matches[0]
+    if is_suspicious_contamination_order(matched, candidates):
+        return None, None
+    return matched, ProvenanceRecord.CONFIDENCE_BOOTSTRAP
 
 
 def sha256_of_file(path):

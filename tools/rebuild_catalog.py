@@ -79,7 +79,7 @@ from mirror_common import (
 )
 from provenance import (
     UpstreamStanza, match_provenance, ProvenanceResult, ProvenanceRecord,
-    verify_continuity,
+    verify_continuity, try_bootstrap_match,
 )
 
 import mirror_ubuntu
@@ -372,13 +372,15 @@ def bulk_fetch_info_and_sha256(arch, workdir):
     return info_map, sha256_map
 
 
-def stanza_to_record(name, arch, stanza, wsh_filename, payload_sha256):
+def stanza_to_record(name, arch, stanza, wsh_filename, payload_sha256,
+                      confidence=ProvenanceRecord.CONFIDENCE_VERIFIED):
     return ProvenanceRecord(
         name=name, arch=arch, source_distro=stanza.source_distro,
         suite=stanza.suite, source_arch=stanza.source_arch,
         component=stanza.component, upstream_name=stanza.upstream_name,
         upstream_version=stanza.upstream_version, wsh_filename=wsh_filename,
         payload_sha256=payload_sha256, upstream_filename=stanza.upstream_filename,
+        confidence=confidence,
     )
 
 
@@ -395,6 +397,7 @@ class CatalogRebuild:
             "arch": arch,
             "repaired": {}, "unchanged": {}, "ambiguous": {},
             "orphaned": {}, "unresolved": {}, "rejected": {},
+            "bootstrap_matched": {},
         }
         self.staged_info = {}     # name -> new .info text
         self.provides_index = {} # virtual -> set(real names)
@@ -433,6 +436,11 @@ class CatalogRebuild:
               f"per RESOLVED package (current .info + live .wsh.sha256), so it "
               f"is the slowest phase", file=sys.stderr, flush=True)
 
+        bootstrap_excluded = self._load_bootstrap_exclusions()
+        print(f"[run] {len(bootstrap_excluded)} package(s) excluded from "
+              f"bootstrap live-info matching (known-contaminated/manually-"
+              f"repaired list)", file=sys.stderr, flush=True)
+
         processed = 0
         deadline_stopped = False
         for name, result in manifest.items():
@@ -461,8 +469,35 @@ class CatalogRebuild:
                 self._bump("unresolved", "unknown")
                 continue
             if result.status == ProvenanceResult.AMBIGUOUS:
-                distros = ",".join(sorted({c.source_distro for c in result.candidates}))
-                self._bump("ambiguous", distros)
+                # Genuinely ambiguous by name+version+arch alone -- before
+                # giving up, try bootstrap disambiguation via byte-for-byte
+                # comparison against the already-live .info (see
+                # tools/provenance.try_bootstrap_match). This is NOT a
+                # guess: it only accepts when exactly one candidate's
+                # freshly-rendered metadata matches what's already
+                # published, corroborating (not proving) that candidate's
+                # identity, excludes known-contaminated packages outright,
+                # and refuses matches that fit the historical cross-distro
+                # contamination bug's own signature.
+                live_info = self._fetch_current_info(name)
+                bootstrap_stanza, confidence = try_bootstrap_match(
+                    name, result.candidates, live_info, bootstrap_excluded,
+                    render_info_from_stanza)
+                if bootstrap_stanza is None:
+                    distros = ",".join(sorted({c.source_distro for c in result.candidates}))
+                    self._bump("ambiguous", distros)
+                    continue
+                # Bootstrap-accepted: content already matches live, so this
+                # is definitionally "unchanged" -- staged for the provides
+                # rebuild same as any resolved package, but recorded with
+                # the weaker CONFIDENCE_BOOTSTRAP tier, never verified.
+                wsh_filename = self._current_wsh_filename(name, canonical_versions[name])
+                live_sha256 = self._fetch_live_payload_sha256(name)
+                self.new_manifest[name] = stanza_to_record(
+                    name, self.arch, bootstrap_stanza, wsh_filename, live_sha256,
+                    confidence=confidence)
+                self.staged_info[name] = live_info
+                self._bump("bootstrap_matched", bootstrap_stanza.source_distro)
                 continue
             # RESOLVED by name+version+arch -- now strengthen with
             # filename/checksum continuity where available (item: "verify
@@ -704,6 +739,21 @@ class CatalogRebuild:
         if b2_get("state/excluded-deps.txt", tmp):
             with open(tmp) as f:
                 return {l.strip() for l in f if l.strip()}
+        return set()
+
+    def _load_bootstrap_exclusions(self):
+        """Package names that must NEVER go through bootstrap live-info
+        matching -- known-contaminated (e.g. anything the cross-distro
+        backfill version-mismatch incident touched) or manually-repaired
+        packages, whose live .info might itself be exactly the kind of
+        content a bootstrap match would wrongly treat as trustworthy
+        corroboration. Maintained at state/bootstrap-excluded.txt (one
+        canonical name per line, '#' comments allowed); empty/absent is
+        valid (no exclusions yet known)."""
+        tmp = os.path.join(self.workdir, "bootstrap-excluded.txt")
+        if b2_get("state/bootstrap-excluded.txt", tmp):
+            with open(tmp) as f:
+                return {l.strip() for l in f if l.strip() and not l.startswith("#")}
         return set()
 
     def _find_orphans(self, canonical_names):
