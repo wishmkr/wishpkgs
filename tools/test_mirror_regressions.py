@@ -35,6 +35,19 @@ Regression tests for the mirror-pipeline bugs found 2026-07-22:
      (state/backfill/<arch>/shard<N>-provides.txt); a single separate
      merge job unions all of them plus the existing canonical file and
      uploads once, so there is exactly one writer of the canonical key.
+  5. tools/backfill_metadata.py processed Ubuntu then Debian (then Fedora)
+     in one run without checking that an upstream stanza's VERSION matched
+     what was actually canonically published. The same package name can
+     exist in more than one distro's archive at a genuinely different
+     version (Ubuntu's own "libgcc-s1" vs Debian's own "libgcc-s1" --
+     different packages, same name) -- Debian's stanza silently overwrote
+     an Ubuntu-sourced package's .info with Debian's own unrelated
+     dependency graph (Depends: gcc-14-base -> Depends: gcc-12-base, a
+     package that was never mirrored at all, since Ubuntu noble doesn't
+     ship it), which is exactly what caused a large cluster of
+     "missing_from_index" failures cascading from libgcc-s1 in a live
+     catalog test. Fixed by checking the stanza's sanitized version against
+     mirror_common.load_canonical_versions() before trusting it.
 
 No network access, no B2 credentials -- everything here runs against
 synthetic Packages-file text and a stubbed http_get/b2_get/b2_cp, so it's
@@ -287,6 +300,84 @@ class ProvidesShardMergeTests(unittest.TestCase):
         merged = self._fake_b2["index/aarch64-provides.txt"]
         self.assertIn("old-virt old-real", merged)
         self.assertIn("new-virt new-real", merged)
+
+
+class BackfillCrossDistroVersionGuardTests(unittest.TestCase):
+    """Item 5: backfill_deb() must only trust an upstream stanza whose
+    version matches what's actually canonically published for that name --
+    the exact bug that let Debian's libgcc-s1 overwrite Ubuntu's."""
+
+    UBUNTU_LIBGCC_S1 = (
+        "Package: libgcc-s1\n"
+        "Version: 14-20240412-0ubuntu1\n"
+        "Depends: gcc-14-base (= 14-20240412-0ubuntu1), libc6 (>= 2.35)\n"
+        "Provides: libgcc1 (= 1:14-20240412-0ubuntu1)\n"
+        "Description: GCC support library\n"
+        "\n"
+    )
+    DEBIAN_LIBGCC_S1 = (
+        "Package: libgcc-s1\n"
+        "Version: 12.2.0-14+deb12u1\n"
+        "Depends: gcc-12-base (= 12.2.0-14+deb12u1), libc6 (>= 2.35)\n"
+        "Description: GCC support library\n"
+        "\n"
+    )
+
+    def setUp(self):
+        import backfill_metadata as bm
+        import mirror_ubuntu, mirror_debian
+        self.bm, self.mu, self.md = bm, mirror_ubuntu, mirror_debian
+        self._orig = {
+            "bm_b2_cp": bm.b2_cp, "bm_b2_get": bm.b2_get,
+            "mu_fetch": mirror_ubuntu.fetch_packages_index,
+            "md_fetch": mirror_debian.fetch_packages_index,
+        }
+        self.calls = []
+        bm.b2_cp = lambda local, key: self.calls.append(
+            (key, open(local).read()))
+        bm.b2_get = lambda key, local: False
+        mirror_ubuntu.fetch_packages_index = lambda *a, **k: self.UBUNTU_LIBGCC_S1
+        mirror_debian.fetch_packages_index = lambda *a, **k: self.DEBIAN_LIBGCC_S1
+        bm.NUM_SHARDS = 1
+
+    def tearDown(self):
+        self.bm.b2_cp, self.bm.b2_get = self._orig["bm_b2_cp"], self._orig["bm_b2_get"]
+        self.mu.fetch_packages_index = self._orig["mu_fetch"]
+        self.md.fetch_packages_index = self._orig["md_fetch"]
+
+    def test_debian_stanza_rejected_when_canonical_version_is_ubuntus(self):
+        canonical_versions = {"libgcc-s1": "14"}  # matches the Ubuntu stanza
+        import tempfile
+        workdir = tempfile.mkdtemp()
+
+        n_ubuntu, _ = self.bm.backfill_deb(
+            self.mu, "ubuntu", "x86_64", canonical_versions, workdir, ["main"])
+        n_debian, _ = self.bm.backfill_deb(
+            self.md, "debian", "x86_64", canonical_versions, workdir, ["main"])
+
+        self.assertEqual(n_ubuntu, 1)
+        self.assertEqual(n_debian, 0)
+        info_content = dict(self.calls)["pkgs/x86_64/libgcc-s1.info"]
+        self.assertIn("gcc-14-base", info_content)
+        self.assertNotIn("gcc-12-base", info_content)
+
+    def test_ubuntu_stanza_rejected_when_canonical_version_is_debians(self):
+        # Symmetric case: if the ACTUALLY-mirrored payload was Debian's,
+        # Ubuntu's differently-versioned stanza must be the one rejected.
+        canonical_versions = {"libgcc-s1": "12.2.0"}
+        import tempfile
+        workdir = tempfile.mkdtemp()
+
+        n_ubuntu, _ = self.bm.backfill_deb(
+            self.mu, "ubuntu", "x86_64", canonical_versions, workdir, ["main"])
+        n_debian, _ = self.bm.backfill_deb(
+            self.md, "debian", "x86_64", canonical_versions, workdir, ["main"])
+
+        self.assertEqual(n_ubuntu, 0)
+        self.assertEqual(n_debian, 1)
+        info_content = dict(self.calls)["pkgs/x86_64/libgcc-s1.info"]
+        self.assertIn("gcc-12-base", info_content)
+        self.assertNotIn("gcc-14-base", info_content)
 
 
 if __name__ == "__main__":

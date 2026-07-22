@@ -304,6 +304,15 @@ def parse_name_from_index_line(line):
     return m.group("name") if m else None
 
 
+def parse_name_version_from_index_line(line):
+    """Same as parse_name_from_index_line but also returns the version --
+    needed by backfill_metadata.py to confirm an upstream stanza it found
+    actually corresponds to what's canonically published before trusting
+    its dependency data (see load_canonical_versions)."""
+    m = _WSH_LINE_RE.match(line.strip())
+    return (m.group("name"), m.group("version")) if m else (None, None)
+
+
 def _index_line_is_blocked(line):
     """is_blocked() takes a bare package name, not a full
     "name-version-release-arch.wsh" index line -- extract the name first.
@@ -327,6 +336,35 @@ def load_canonical_names(arch, state_dir):
                 if name:
                     names.add(name)
     return names
+
+
+def load_canonical_versions(arch, state_dir):
+    """name -> version map for everything canonically published. The SAME
+    package name can legitimately exist in more than one upstream distro's
+    archive at a DIFFERENT version (e.g. Ubuntu's own "libgcc-s1" vs
+    Debian's own "libgcc-s1" -- real, separate packages, not duplicates).
+    Only one of them is ever actually mirrored (whichever distro's mirror
+    script got there first); backfill_metadata.py needs to know WHICH
+    version that was so it only trusts a distro's upstream stanza for a
+    package when that stanza's version matches what's actually published --
+    otherwise a later distro pass in the same backfill run can silently
+    overwrite a package's dependency metadata with a completely different
+    distro's dependency graph, for a version that was never mirrored at
+    all. This is a real bug that shipped once: Debian's libgcc-s1
+    (12.2.0-14+deb12u1, Depends: gcc-12-base) overwrote the .info of an
+    Ubuntu-sourced libgcc-s1 payload (version 14-20240412-0ubuntu1,
+    Depends: gcc-14-base) during a backfill run, because both distros
+    happen to ship a same-named package and nothing checked the version
+    matched before trusting the stanza."""
+    tmp = os.path.join(state_dir, f"canonical-versions-{arch}.index")
+    versions = {}
+    if b2_get(f"index/{arch}.txt", tmp):
+        with open(tmp) as f:
+            for line in f:
+                name, version = parse_name_version_from_index_line(line)
+                if name:
+                    versions[name] = version
+    return versions
 
 
 def merge_index(arch, distro, own_index_path, state_dir, num_shards, shard):

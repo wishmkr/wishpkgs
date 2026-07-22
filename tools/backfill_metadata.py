@@ -15,25 +15,32 @@ doesn't need to change. Re-running the full mirror to fix this would mean
 re-downloading and re-uploading ~17k packages' payloads for a metadata-only
 problem -- wasteful and slow. This script instead:
 
-  1. Loads the set of package names already published to index/<arch>.txt
-     (mirror_common.load_canonical_names) -- the only things eligible for
-     backfill; anything not already mirrored is left alone (that's the
-     regular mirror's job).
+  1. Loads a name -> version map of everything already published to
+     index/<arch>.txt (mirror_common.load_canonical_versions) -- the only
+     things eligible for backfill; anything not already mirrored is left
+     alone (that's the regular mirror's job).
   2. Re-fetches the upstream Packages.gz (Ubuntu/Debian) / primary.xml
      (Fedora) index files -- same as the regular mirror scripts already do
-     -- and, for every stanza whose sanitized name is in the canonical set,
-     regenerates just the .info content using the CURRENT (fixed)
-     sanitize/parse logic.
+     -- and, for every stanza whose sanitized name is canonical AND whose
+     sanitized VERSION matches what's actually published, regenerates just
+     the .info content using the CURRENT (fixed) sanitize/parse logic. The
+     version check matters: the same name can legitimately exist in more
+     than one upstream distro's archive at a different version (Ubuntu's
+     own "libgcc-s1" vs Debian's own "libgcc-s1" are different packages
+     that happen to share a name) -- without it, processing Ubuntu then
+     Debian in one run lets Debian's stanza silently overwrite an
+     Ubuntu-sourced package's metadata with a totally unrelated dependency
+     graph for a version that was never mirrored. This shipped once
+     (corrupted libgcc-s1's Depends from gcc-14-base to gcc-12-base) before
+     being caught by a live catalog test.
   3. Uploads only the new pkgs/<arch>/<name>.info, and accumulates
-     Provides pairs into the shared index/<arch>-provides.txt. Never
-     touches pkgs/<arch>/<name>-*.wsh or its .sha256.
+     Provides pairs into a per-shard partial file, merged into the shared
+     index/<arch>-provides.txt by a single separate job afterward (see
+     publish_provides_shard/merge_provides_shards below). Never touches
+     pkgs/<arch>/<name>-*.wsh or its .sha256.
 
 Sharded the same way the mirror scripts are (stable md5-of-name partition)
-so a full-catalog backfill can be split across parallel jobs; each shard's
-provides contribution is published via the same read-union-write pattern
-heal_missing.py uses (last-writer-wins on a race between concurrent
-shards finishing at the exact same moment is an accepted, pre-existing
-tradeoff of that pattern -- a later re-run always converges).
+so a full-catalog backfill can be split across parallel jobs.
 """
 import os
 import sys
@@ -43,8 +50,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mirror_common import (
     b2_cp, b2_get, is_blocked, in_shard, redact, sanitize_name,
-    load_canonical_names, parse_dep_field, format_dep_field, provides_names,
-    rpm_entries_to_groups,
+    sanitize_version, load_canonical_versions, parse_dep_field,
+    format_dep_field, provides_names, rpm_entries_to_groups,
 )
 
 import mirror_ubuntu
@@ -81,7 +88,7 @@ def write_info(workdir, name, description, license_line, depends, provides, conf
     return info_path
 
 
-def backfill_deb(distro_mod, distro_name, arch_wish, canonical, workdir, components):
+def backfill_deb(distro_mod, distro_name, arch_wish, canonical_versions, workdir, components):
     """Shared logic for mirror_ubuntu / mirror_debian, whose Packages-file
     stanza shape and .info fields are identical. `components` is passed in
     explicitly rather than read from distro_mod.COMPONENTS -- both mirror
@@ -107,13 +114,28 @@ def backfill_deb(distro_mod, distro_name, arch_wish, canonical, workdir, compone
             if deadline_hit():
                 break
             name_raw = pkg.get("Package")
-            if not name_raw or is_blocked(name_raw):
+            ver_raw = pkg.get("Version")
+            if not name_raw or not ver_raw or is_blocked(name_raw):
                 continue
             if not in_shard(name_raw, SHARD, NUM_SHARDS):
                 continue
             name = sanitize_name(name_raw)
-            if name not in canonical:
+            if name not in canonical_versions:
                 continue  # never mirrored -- not this script's job
+            # CRITICAL: the same package NAME can exist in more than one
+            # upstream distro's archive at a genuinely different version
+            # (Ubuntu's own "libgcc-s1" vs Debian's own "libgcc-s1" -- two
+            # separate packages that happen to share a name). Only the
+            # distro/version that was ACTUALLY mirrored is authoritative
+            # for this name; a same-named stanza from a DIFFERENT distro at
+            # a different version must be skipped, not trusted -- otherwise
+            # processing Ubuntu then Debian in the same run lets Debian's
+            # unrelated dependency graph silently overwrite the real
+            # (Ubuntu-sourced) package's metadata. This exact bug shipped
+            # once and corrupted libgcc-s1's .info (gcc-14-base -> the
+            # wrong gcc-12-base) before being caught.
+            if sanitize_version(ver_raw) != canonical_versions[name]:
+                continue
 
             depends = format_dep_field(parse_dep_field(pkg.get("Depends", "")))
             conflicts = format_dep_field(parse_dep_field(pkg.get("Conflicts", "")))
@@ -133,7 +155,7 @@ def backfill_deb(distro_mod, distro_name, arch_wish, canonical, workdir, compone
     return rewritten, provides_pairs
 
 
-def backfill_fedora(arch_wish, canonical, workdir):
+def backfill_fedora(arch_wish, canonical_versions, workdir):
     cfg = mirror_fedora.ARCHES[arch_wish]
     rpm_arch = cfg["rpm_arch"]
     rewritten, provides_pairs = 0, []
@@ -153,7 +175,12 @@ def backfill_fedora(arch_wish, canonical, workdir):
         if not in_shard(name_raw, SHARD, NUM_SHARDS):
             continue
         name = sanitize_name(name_raw)
-        if name not in canonical:
+        if name not in canonical_versions:
+            continue
+        # See backfill_deb()'s identical check -- the same name can exist
+        # in more than one distro's archive at a different version; only
+        # the actually-mirrored version's stanza is authoritative.
+        if sanitize_version(pkg["version"]) != canonical_versions[name]:
             continue
 
         depends = format_dep_field(rpm_entries_to_groups(pkg["requires"]))
@@ -229,8 +256,8 @@ def merge_provides_shards(arch, num_shards):
 def main():
     print(f"backfill shard {SHARD}/{NUM_SHARDS} arch={ARCH} distros={DISTROS}", file=sys.stderr)
     workdir = tempfile.mkdtemp()
-    canonical = load_canonical_names(ARCH, workdir)
-    print(f"{len(canonical)} canonical names loaded for {ARCH}", file=sys.stderr)
+    canonical = load_canonical_versions(ARCH, workdir)
+    print(f"{len(canonical)} canonical name/version pairs loaded for {ARCH}", file=sys.stderr)
 
     total_rewritten = 0
     all_provides = []
