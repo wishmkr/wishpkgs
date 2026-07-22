@@ -1,0 +1,65 @@
+name: Rebuild catalog (provenance-aware full repair)
+
+# Full provenance-aware catalog repair -- see tools/rebuild_catalog.py's
+# module docstring for the complete pipeline. Runs UNSHARDED per arch
+# (unlike the mirror/backfill scripts): the strict publish gate needs a
+# complete picture of every canonical package's provenance before it can
+# decide whether to publish anything at all, so splitting the work across
+# shards would fragment that decision. Self-stops cleanly at
+# REBUILD_DEADLINE_SECONDS, well under the runner's hard timeout, the same
+# pattern the mirror scripts already use.
+#
+# Defaults to --dry-run (publish input is false): reads live upstream +
+# B2 state and writes a repair-report-<arch>.json artifact, touches
+# nothing. Safe to run repeatedly against production for inspection.
+# publish: true attempts the real thing, but the strict gate in
+# rebuild_catalog.py refuses to publish anything unless EVERY canonical
+# package resolved cleanly and every dependency classified -- expect it to
+# refuse on a catalog with genuine upstream gaps (there will be some, at
+# ~16k+ packages) until those are dealt with. That refusal is by design.
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Attempt to publish (strict gate still applies; false = report-only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.B2_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+  AWS_DEFAULT_REGION: eu-central-003
+  B2_HTTP: https://s3.eu-central-003.backblazeb2.com
+  REBUILD_DEADLINE_SECONDS: "19500"
+  REBUILD_COMPONENTS_UBUNTU: "main,universe,multiverse,restricted"
+  REBUILD_COMPONENTS_DEBIAN: "main,contrib,non-free-firmware"
+
+jobs:
+  rebuild:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, x86_64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install rpm/cpio (needed to import mirror_fedora.py)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq rpm cpio zstd
+      - name: Rebuild catalog
+        working-directory: tools
+        run: |
+          ARGS="--arch ${{ matrix.arch }} --report-dir ../repair-reports"
+          if [ "${{ inputs.publish }}" = "true" ]; then
+            ARGS="$ARGS --publish"
+          fi
+          python3 rebuild_catalog.py $ARGS
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: repair-report-${{ matrix.arch }}
+          path: repair-reports/repair-report-${{ matrix.arch }}.json
+          if-no-files-found: warn
