@@ -81,6 +81,7 @@ from mirror_common import (
 from provenance import (
     UpstreamStanza, match_provenance, ProvenanceResult, ProvenanceRecord,
     verify_continuity, try_bootstrap_match, fingerprints_semantically_equal,
+    BootstrapMatchResult,
 )
 
 import mirror_ubuntu
@@ -589,31 +590,53 @@ class CatalogRebuild:
                 # match what's already published -- free-text fields like
                 # description are deliberately excluded (they're what made
                 # an earlier byte-for-byte attempt match almost nothing:
-                # real provenance, but wording drift). Excludes known-
-                # contaminated packages outright, and refuses matches that
-                # fit the historical cross-distro contamination bug's own
-                # signature.
+                # real provenance, but wording drift). Classification is
+                # purely evidence-based (zero matches -> unresolved, one
+                # match -> accepted, multiple -> still ambiguous); rejection
+                # only ever happens for concrete contradictions (known-
+                # contaminated exclusion list, a filename that doesn't
+                # self-consistently name its own package, or -- checked
+                # just below, same as for normally-verified matches -- a
+                # conflict with the prior trusted manifest).
                 live_info = self._fetch_current_info(name)
                 live_fingerprint = (
                     semantic_fingerprint_from_live_info(
                         name, self.arch, canonical_versions[name], live_info)
                     if live_info is not None else None)
-                bootstrap_stanza, confidence = try_bootstrap_match(
+                bootstrap_result = try_bootstrap_match(
                     name, result.candidates, live_fingerprint, bootstrap_excluded,
                     semantic_fingerprint_from_stanza)
-                if bootstrap_stanza is None:
+
+                if bootstrap_result.status == BootstrapMatchResult.UNRESOLVED:
+                    self._bump("unresolved", "bootstrap-no-match")
+                    continue
+                if bootstrap_result.status in (BootstrapMatchResult.AMBIGUOUS,
+                                                BootstrapMatchResult.REJECTED):
                     distros = ",".join(sorted({c.source_distro for c in result.candidates}))
                     self._bump("ambiguous", distros)
                     continue
+
+                # ACCEPTED by fingerprint -- still subject to the same
+                # continuity check a normally-resolved match gets: a
+                # conflict with the prior TRUSTED manifest (different
+                # source, different filename, different payload hash) is a
+                # concrete contradiction, not mere distro presence in the
+                # pool, so it still fails closed here.
+                bootstrap_stanza = bootstrap_result.stanza
+                live_sha256 = self._fetch_live_payload_sha256(name)
+                prior_record = self.prior_manifest.get(name)
+                if not verify_continuity(bootstrap_stanza, prior_record, live_sha256):
+                    self._bump("unresolved", "bootstrap-continuity-mismatch")
+                    continue
+
                 # Bootstrap-accepted: content already matches live, so this
                 # is definitionally "unchanged" -- staged for the provides
                 # rebuild same as any resolved package, but recorded with
                 # the weaker CONFIDENCE_BOOTSTRAP tier, never verified.
                 wsh_filename = self._current_wsh_filename(name, canonical_versions[name])
-                live_sha256 = self._fetch_live_payload_sha256(name)
                 self.new_manifest[name] = stanza_to_record(
                     name, self.arch, bootstrap_stanza, wsh_filename, live_sha256,
-                    confidence=confidence)
+                    confidence=bootstrap_result.confidence)
                 self.staged_info[name] = live_info
                 self._bump("bootstrap_matched", bootstrap_stanza.source_distro)
                 continue
@@ -1054,12 +1077,13 @@ def diagnose_ambiguous(arch, sample_size, out_path):
 def evaluate_bootstrap_semantic(arch, sample_size, out_path):
     """Dry-run evaluation of the semantic-fingerprint bootstrap mechanism
     against a SAMPLE of real ambiguous packages, before trusting it against
-    the whole catalog. For each sampled ambiguous package: attempts the
+    the whole catalog. For each sampled ambiguous package: calls the exact
     same try_bootstrap_match() the real run uses, and buckets the outcome
-    as accepted / zero_match / multi_match / contamination_blocked.
-    "False matches" have no automatic ground truth -- every ACCEPTED
-    match's full candidate identity (source distro/suite/component/
-    version, and which fingerprint fields existed on each side) is
+    by its evidence-based status -- accepted / unresolved (zero matches) /
+    ambiguous (multiple matches) / rejected (one match, but a concrete
+    contradiction: excluded, or a self-inconsistent filename). "False
+    matches" have no automatic ground truth -- every ACCEPTED match's full
+    candidate identity (source distro/suite/component/version) is
     reported in full for manual audit, not just a count."""
     workdir = tempfile.mkdtemp()
     canonical_versions = load_canonical_versions(arch, workdir)
@@ -1071,8 +1095,7 @@ def evaluate_bootstrap_semantic(arch, sample_size, out_path):
           file=sys.stderr, flush=True)
     manifest = build_provenance_manifest(canonical_versions, stanzas, arch)
 
-    buckets = {"accepted": [], "zero_match": [], "multi_match": [],
-               "contamination_blocked": []}
+    buckets = {"accepted": [], "unresolved": [], "ambiguous": [], "rejected": []}
     checked = 0
     for name, result in manifest.items():
         if result.status != ProvenanceResult.AMBIGUOUS:
@@ -1086,65 +1109,54 @@ def evaluate_bootstrap_semantic(arch, sample_size, out_path):
                        name, arch, canonical_versions[name], live_info)
                    if live_info is not None else None)
         candidates = result.candidates
-        raw_matches = ([c for c in candidates
-                        if fingerprints_semantically_equal(
-                            semantic_fingerprint_from_stanza(c), live_fp)]
-                       if live_fp is not None else [])
+
+        bootstrap_result = try_bootstrap_match(
+            name, candidates, live_fp, set(), semantic_fingerprint_from_stanza)
 
         detail = {
             "name": name, "canonical_version": canonical_versions[name],
             "candidate_count": len(candidates),
             "candidate_distros": sorted({c.source_distro for c in candidates}),
-            "raw_match_count": len(raw_matches),
-            "raw_match_distros": sorted({c.source_distro for c in raw_matches}),
+            "status": bootstrap_result.status,
+            "reason": bootstrap_result.reason,
         }
-
-        if live_fp is None:
-            detail["reason"] = "no live .info to compare against"
-            buckets["zero_match"].append(detail)
-            continue
-        if len(raw_matches) == 0:
-            buckets["zero_match"].append(detail)
-            continue
-        if len(raw_matches) > 1:
-            buckets["multi_match"].append(detail)
-            continue
-
-        matched, confidence = try_bootstrap_match(
-            name, candidates, live_fp, set(), semantic_fingerprint_from_stanza)
-        if matched is None:
-            detail["reason"] = "contamination-order heuristic rejected the match"
-            detail["would_have_matched_distro"] = raw_matches[0].source_distro
-            buckets["contamination_blocked"].append(detail)
-            continue
-
-        detail["accepted_distro"] = matched.source_distro
-        detail["accepted_suite"] = matched.suite
-        detail["accepted_component"] = matched.component
-        detail["accepted_upstream_version"] = matched.upstream_version
-        detail["confidence"] = confidence
-        buckets["accepted"].append(detail)
+        if bootstrap_result.status == BootstrapMatchResult.ACCEPTED:
+            m = bootstrap_result.stanza
+            detail["accepted_distro"] = m.source_distro
+            detail["accepted_suite"] = m.suite
+            detail["accepted_component"] = m.component
+            detail["accepted_upstream_version"] = m.upstream_version
+            detail["confidence"] = bootstrap_result.confidence
+            buckets["accepted"].append(detail)
+        elif bootstrap_result.status == BootstrapMatchResult.UNRESOLVED:
+            buckets["unresolved"].append(detail)
+        elif bootstrap_result.status == BootstrapMatchResult.AMBIGUOUS:
+            buckets["ambiguous"].append(detail)
+        else:
+            detail["rejected_candidate_distro"] = (
+                bootstrap_result.stanza.source_distro if bootstrap_result.stanza else None)
+            buckets["rejected"].append(detail)
 
     out = {
         "arch": arch,
         "sample_size_requested": sample_size,
         "sample_size_checked": checked,
         "accepted": len(buckets["accepted"]),
-        "zero_match": len(buckets["zero_match"]),
-        "multi_match": len(buckets["multi_match"]),
-        "contamination_blocked": len(buckets["contamination_blocked"]),
+        "unresolved": len(buckets["unresolved"]),
+        "ambiguous": len(buckets["ambiguous"]),
+        "rejected": len(buckets["rejected"]),
         "accepted_detail": buckets["accepted"],
-        "zero_match_detail": buckets["zero_match"][:30],
-        "multi_match_detail": buckets["multi_match"][:30],
-        "contamination_blocked_detail": buckets["contamination_blocked"],
+        "unresolved_detail": buckets["unresolved"][:30],
+        "ambiguous_detail": buckets["ambiguous"][:30],
+        "rejected_detail": buckets["rejected"],
     }
     with open(out_path, "w") as f:
         json.dump(out, f, indent=2, sort_keys=True)
     print(f"[evaluate] {arch}: of {checked} sampled ambiguous packages -- "
           f"accepted={len(buckets['accepted'])} "
-          f"zero_match={len(buckets['zero_match'])} "
-          f"multi_match={len(buckets['multi_match'])} "
-          f"contamination_blocked={len(buckets['contamination_blocked'])}; "
+          f"unresolved={len(buckets['unresolved'])} "
+          f"ambiguous={len(buckets['ambiguous'])} "
+          f"rejected={len(buckets['rejected'])}; "
           f"wrote {out_path}", file=sys.stderr, flush=True)
     return out
 

@@ -113,7 +113,11 @@ class ProvenanceMatchingTests(unittest.TestCase):
 
     def test_ambiguous_fails_closed(self):
         # At the orchestration level: an ambiguous package must never end
-        # up in staged_info (nothing would ever be published for it).
+        # up in staged_info (nothing would ever be published for it). With
+        # no live .info to attempt bootstrap disambiguation against, there
+        # is zero evidence either way, so this lands in "unresolved" (not
+        # "ambiguous") under the evidence-based taxonomy -- either way it
+        # must never be staged or published.
         rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
         rc_stanzas = [
             stanza("ubuntu", "noble", "arm64", "main", "foo", "1.0-1ubuntu1"),
@@ -125,7 +129,7 @@ class ProvenanceMatchingTests(unittest.TestCase):
         rebuild._find_orphans = lambda names: []
         report = rebuild.run()
         self.assertNotIn("foo", rebuild.staged_info)
-        self.assertEqual(sum(report["ambiguous"].values()), 1)
+        self.assertEqual(sum(report["unresolved"].values()), 1)
         self.assertEqual(sum(report.get("repaired", {}).values()), 0)
 
 
@@ -296,7 +300,7 @@ class StrictPublishGateTests(unittest.TestCase):
         report = rebuild.run()
         self.assertFalse(report["published"])
         self.assertEqual(published_calls, [])
-        self.assertTrue(any("ambiguous" in b for b in report["publish_blockers"]))
+        self.assertTrue(any("proven provenance" in b for b in report["publish_blockers"]))
         # clean-pkg resolved fine on its own -- but the WHOLE publish is
         # still blocked because shared-name didn't, not just shared-name's
         # own metadata.
@@ -527,14 +531,18 @@ class BootstrapSemanticMatchTests(unittest.TestCase):
                                raw={"Depends": "libbar1|libfoo1"},  # reversed order
                                wish_arch=u.wish_arch))
 
-        matched, confidence = rc.try_bootstrap_match(
+        result = rc.try_bootstrap_match(
             "shared-pkg", [u, d],
             rc.semantic_fingerprint_from_live_info("shared-pkg", "aarch64", "1.0", live_info),
             set(), rc.semantic_fingerprint_from_stanza)
-        self.assertIs(matched, u)
-        self.assertEqual(confidence, rc.ProvenanceRecord.CONFIDENCE_BOOTSTRAP)
+        self.assertEqual(result.status, rc.BootstrapMatchResult.ACCEPTED)
+        self.assertIs(result.stanza, u)
+        self.assertEqual(result.confidence, rc.ProvenanceRecord.CONFIDENCE_BOOTSTRAP)
 
-    def test_no_semantic_match_stays_ambiguous(self):
+    def test_no_semantic_match_is_unresolved_not_ambiguous(self):
+        # Zero candidates match the live fingerprint -- under the
+        # evidence-based taxonomy this is UNRESOLVED (no evidence either
+        # way), distinct from AMBIGUOUS (multiple, conflicting evidence).
         u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1")
         live_info = "description=x\nlicense=x\ndepends=libneither1\n"
 
@@ -547,7 +555,8 @@ class BootstrapSemanticMatchTests(unittest.TestCase):
         report = rebuild.run()
 
         self.assertEqual(sum(report["bootstrap_matched"].values()), 0)
-        self.assertEqual(sum(report["ambiguous"].values()), 1)
+        self.assertEqual(sum(report["ambiguous"].values()), 0)
+        self.assertEqual(sum(report["unresolved"].values()), 1)
         self.assertNotIn("shared-pkg", rebuild.staged_info)
 
     def test_both_candidates_matching_identically_stays_ambiguous(self):
@@ -583,36 +592,71 @@ class BootstrapSemanticMatchTests(unittest.TestCase):
         self.assertEqual(sum(report["bootstrap_matched"].values()), 0)
         self.assertEqual(sum(report["ambiguous"].values()), 1)
 
-    def test_contamination_order_heuristic_rejects_suspicious_match(self):
-        # Debian matches live content, but Ubuntu (earlier in
-        # HISTORICAL_BACKFILL_ORDER) is ALSO a candidate that doesn't
-        # match -- this is exactly the shape the historical "later distro
-        # silently overwrote an earlier one" bug would produce, so it must
-        # be rejected even though the name+fingerprint match is otherwise
-        # clean.
+    def test_unique_match_from_non_earliest_distro_is_still_accepted(self):
+        # The removed distro-order heuristic used to reject a unique,
+        # clean Debian match merely because an Ubuntu candidate was ALSO
+        # present in the pool (even though Ubuntu's own fingerprint didn't
+        # match). Acceptance must be evidence-based: since only Debian's
+        # fingerprint matches, it is accepted regardless of distro order.
         u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1")
         live_info = self._live_info_for(d)  # only matches Debian
 
-        matched, confidence = rc.try_bootstrap_match(
+        result = rc.try_bootstrap_match(
             "shared-pkg", [u, d],
             rc.semantic_fingerprint_from_live_info("shared-pkg", "aarch64", "1.0", live_info),
             set(), rc.semantic_fingerprint_from_stanza)
-        self.assertIsNone(matched)
-        self.assertIsNone(confidence)
+        self.assertEqual(result.status, rc.BootstrapMatchResult.ACCEPTED)
+        self.assertIs(result.stanza, d)
+        self.assertEqual(result.confidence, rc.ProvenanceRecord.CONFIDENCE_BOOTSTRAP)
 
-    def test_contamination_order_heuristic_allows_earliest_distro_match(self):
-        # Symmetric case: Ubuntu (earliest in the order) is the one that
-        # matches -- nothing "later" could have overwritten it, so this is
-        # legitimate and must be accepted.
+    def test_self_inconsistent_upstream_filename_is_rejected(self):
+        # A concrete contradiction (not a distro-order guess): the unique
+        # semantic match's own recorded upstream filename doesn't even
+        # reference its own package name, so the match is REJECTED rather
+        # than accepted, despite being the only fingerprint match.
         u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1")
+        u.upstream_filename = "totally-unrelated-package_9.9-1_arm64.deb"
         live_info = self._live_info_for(u)  # only matches Ubuntu
 
-        matched, confidence = rc.try_bootstrap_match(
+        result = rc.try_bootstrap_match(
             "shared-pkg", [u, d],
             rc.semantic_fingerprint_from_live_info("shared-pkg", "aarch64", "1.0", live_info),
             set(), rc.semantic_fingerprint_from_stanza)
-        self.assertIs(matched, u)
-        self.assertEqual(confidence, rc.ProvenanceRecord.CONFIDENCE_BOOTSTRAP)
+        self.assertEqual(result.status, rc.BootstrapMatchResult.REJECTED)
+        self.assertIs(result.stanza, u)
+
+    def test_bootstrap_match_still_verifies_continuity_against_prior_manifest(self):
+        # A bootstrap-accepted match is still subject to the same
+        # prior-trusted-manifest continuity check as a normally-resolved
+        # match: if a PRIOR run already established "shared-pkg" came from
+        # Debian, a bootstrap match now pointing at Ubuntu is a concrete
+        # contradiction and must fail closed to unresolved, not silently
+        # override the prior record.
+        u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1")
+        live_info = self._live_info_for(u)  # matches only Ubuntu this time
+
+        prior_record = rc.ProvenanceRecord(
+            name="shared-pkg", arch="aarch64", source_distro="debian", suite="bookworm",
+            source_arch="arm64", component="main", upstream_name="shared-pkg",
+            upstream_version="1.0-1", wsh_filename="shared-pkg-1.0-1-aarch64.wsh",
+            payload_sha256=None,
+        )
+
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: live_info
+        rebuild._find_orphans = lambda names: []
+        orig_load = rc.load_provenance_manifest
+        rc.load_provenance_manifest = lambda arch, workdir: {"shared-pkg": prior_record}
+        try:
+            report = rebuild.run()
+        finally:
+            rc.load_provenance_manifest = orig_load
+
+        self.assertEqual(sum(report["bootstrap_matched"].values()), 0)
+        self.assertEqual(sum(report["unresolved"].values()), 1)
+        self.assertNotIn("shared-pkg", rebuild.staged_info)
 
     def test_bootstrap_match_does_not_block_publish(self):
         # The whole point of bootstrap matching is to let an otherwise-

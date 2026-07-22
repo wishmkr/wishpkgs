@@ -262,38 +262,43 @@ def verify_continuity(stanza, prior_record, live_payload_sha256):
     return True
 
 
-# The distro processing order backfill_metadata.py used BEFORE the
-# cross-distro version-guard fix (ubuntu, debian, fedora) -- the exact
-# order whose "last write wins" bug let Debian's libgcc-s1 silently
-# overwrite Ubuntu's. A bootstrap content match landing on a distro that
-# comes AFTER another candidate in this order is indistinguishable from
-# what that historical bug would have produced (the live .info could be
-# "correct" simply because the buggy backfill already overwrote it with
-# that later distro's content) -- such matches are never trusted via
-# bootstrap, see is_suspicious_contamination_order.
-HISTORICAL_BACKFILL_ORDER = ["ubuntu", "debian", "fedora"]
+# REMOVED (2026-07-23): a distro-processing-order heuristic used to reject
+# any bootstrap match where a distro earlier than the winner in
+# ["ubuntu", "debian", "fedora"] was ALSO present in the candidate pool --
+# regardless of whether that earlier candidate's OWN fingerprint matched
+# anything. A 400-package real-catalog evaluation showed this blocked 224
+# (56%) of otherwise-clean single-candidate matches: whenever Ubuntu
+# happened to be a same-name+version candidate (extremely common, since
+# Ubuntu derives from Debian) but simply didn't share the winning
+# candidate's relationship data, the match got rejected anyway -- "an
+# earlier distro exists in the pool" is not evidence of contamination on
+# its own; it's just how common cross-distro name+version collisions are.
+# Real contamination rejection now only happens for CONCRETE
+# contradictions: the package name is in the known-contaminated exclusion
+# list (CatalogRebuild._load_bootstrap_exclusions), the match conflicts
+# with a prior TRUSTED manifest entry (verify_continuity, applied to
+# bootstrap matches the same as verified ones -- see
+# CatalogRebuild.run()), or the candidate's own upstream filename doesn't
+# self-consistently reference its own upstream package name (see
+# stanza_filename_is_self_consistent). Ambiguity itself (multiple
+# candidates' fingerprints ALL matching live content) is still never
+# guessed between -- see try_bootstrap_match's UNRESOLVED/AMBIGUOUS split.
 
 
-def is_suspicious_contamination_order(matched_stanza, all_candidates):
-    """True if some OTHER candidate for the same ambiguous package comes
-    EARLIER than `matched_stanza` in HISTORICAL_BACKFILL_ORDER. A distro
-    unknown to that order is never considered "earlier" than anything (no
-    known bug pattern applies to it)."""
-    def rank(distro):
-        try:
-            return HISTORICAL_BACKFILL_ORDER.index(distro)
-        except ValueError:
-            return -1
-    matched_rank = rank(matched_stanza.source_distro)
-    if matched_rank == -1:
-        return False
-    for c in all_candidates:
-        if c is matched_stanza:
-            continue
-        other_rank = rank(c.source_distro)
-        if other_rank != -1 and other_rank < matched_rank:
-            return True
-    return False
+def stanza_filename_is_self_consistent(stanza):
+    """A concrete payload/build metadata sanity check, unlike the removed
+    order heuristic: if the candidate names an upstream filename at all,
+    that filename's basename should actually reference this stanza's own
+    upstream package name. Catches genuinely garbled/mismatched stanza
+    data (a real contradiction) without penalizing a clean match merely
+    for another, non-matching distro's presence in the pool. A stanza
+    with no filename info at all (upstream_filename is falsy) has nothing
+    to contradict, so it passes -- absence of evidence isn't evidence of
+    a problem."""
+    if not stanza.upstream_filename:
+        return True
+    basename = stanza.upstream_filename.rsplit("/", 1)[-1].lower()
+    return basename.startswith(stanza.upstream_name.lower())
 
 
 # The identity+relationship fields a semantic fingerprint compares.
@@ -335,16 +340,36 @@ def fingerprints_semantically_equal(a, b):
     return True
 
 
+class BootstrapMatchResult:
+    """Evidence-based outcome of try_bootstrap_match -- exactly one of
+    four statuses, never a bare accept/reject boolean, so the caller can
+    tell "no evidence either way" (UNRESOLVED) apart from "genuinely
+    multiple plausible sources" (AMBIGUOUS) apart from "evidence pointed
+    to one source, but a concrete contradiction vetoed it" (REJECTED)."""
+    ACCEPTED = "accepted"       # exactly one candidate's fingerprint matched, no contradiction
+    UNRESOLVED = "unresolved"   # zero candidates' fingerprints matched (or no live info to compare)
+    AMBIGUOUS = "ambiguous"     # multiple candidates' fingerprints matched -- genuine tie
+    REJECTED = "rejected"       # exactly one fingerprint match, but excluded/contradicted
+
+    def __init__(self, status, stanza=None, confidence=None, reason=None):
+        self.status = status
+        self.stanza = stanza
+        self.confidence = confidence
+        self.reason = reason
+
+
 def try_bootstrap_match(name, candidates, live_fingerprint, excluded_names,
                          fingerprint_fn):
     """Attempts to disambiguate an AMBIGUOUS provenance match (see
     match_provenance) using a semantic fingerprint comparison against the
     currently-published .info -- NOT a guess: corroborating evidence, not
-    proof. Only ever used as a BOOTSTRAP mechanism (no prior trusted
-    manifest exists yet to check continuity against via verify_continuity)
-    -- once a package resolves unambiguously on a later run (e.g. upstream
-    versions have since diverged), the normal verified path takes over and
-    this is never consulted again for it.
+    proof. Only ever used as a BOOTSTRAP mechanism for the initial
+    acceptance decision; CatalogRebuild.run() additionally runs
+    verify_continuity() against any prior TRUSTED manifest entry for an
+    ACCEPTED result before finalizing it, same as it does for normally
+    verified matches (a prior-manifest conflict is a concrete
+    contradiction, unlike mere distro presence in the candidate pool --
+    see the removed is_suspicious_contamination_order note above).
 
     Compares normalized package identity + relationship fields only (see
     FINGERPRINT_FIELDS) -- name, architecture, normalized version,
@@ -357,29 +382,47 @@ def try_bootstrap_match(name, candidates, live_fingerprint, excluded_names,
     `live_fingerprint` was built for the live side, so both are directly
     comparable.
 
-    Accepts a candidate only when:
-      - the package name isn't in `excluded_names` (known-contaminated or
-        manually-repaired packages, whose live .info might itself be
-        exactly the kind of content a bootstrap match would wrongly trust
-        -- see CatalogRebuild._load_bootstrap_exclusions),
-      - `live_fingerprint` exists (nothing to corroborate against otherwise),
-      - EXACTLY ONE candidate's fingerprint is semantically equal to
-        live_fingerprint -- zero or multiple matches both stay ambiguous,
-        never guessed between,
-      - the match isn't flagged by is_suspicious_contamination_order.
+    Classification is purely evidence-based:
+      - zero candidates' fingerprints match live_fingerprint -> UNRESOLVED
+        (no evidence points anywhere -- this is NOT the same as
+        "ambiguous", which means multiple plausible sources; here there
+        are zero provable ones, so the honest classification is
+        unresolved, not "give up but leave it looking like a coin-flip
+        between distros").
+      - exactly one candidate's fingerprint matches -> ACCEPTED, UNLESS
+        the package name is in `excluded_names` (known-contaminated /
+        manually-repaired -- see CatalogRebuild._load_bootstrap_exclusions)
+        or the matched stanza fails stanza_filename_is_self_consistent
+        (a concrete payload/build metadata contradiction), in which case
+        REJECTED.
+      - two or more candidates' fingerprints match -> AMBIGUOUS (a
+        genuine tie: multiple sources are equally consistent with what's
+        live -- never guessed between).
 
-    Returns (stanza, ProvenanceRecord.CONFIDENCE_BOOTSTRAP) on acceptance,
-    or (None, None) otherwise."""
-    if name in excluded_names or live_fingerprint is None:
-        return None, None
+    Returns a BootstrapMatchResult."""
+    if live_fingerprint is None:
+        return BootstrapMatchResult(BootstrapMatchResult.UNRESOLVED,
+                                     reason="no live .info to compare against")
     matches = [c for c in candidates
                if fingerprints_semantically_equal(fingerprint_fn(c), live_fingerprint)]
-    if len(matches) != 1:
-        return None, None
+    if len(matches) == 0:
+        return BootstrapMatchResult(BootstrapMatchResult.UNRESOLVED,
+                                     reason="zero candidates match the live fingerprint")
+    if len(matches) > 1:
+        return BootstrapMatchResult(
+            BootstrapMatchResult.AMBIGUOUS,
+            reason=f"{len(matches)} candidates all match the live fingerprint")
+
     matched = matches[0]
-    if is_suspicious_contamination_order(matched, candidates):
-        return None, None
-    return matched, ProvenanceRecord.CONFIDENCE_BOOTSTRAP
+    if name in excluded_names:
+        return BootstrapMatchResult(BootstrapMatchResult.REJECTED,
+                                     stanza=matched, reason="package is bootstrap-excluded")
+    if not stanza_filename_is_self_consistent(matched):
+        return BootstrapMatchResult(
+            BootstrapMatchResult.REJECTED, stanza=matched,
+            reason="upstream filename doesn't reference its own package name")
+    return BootstrapMatchResult(BootstrapMatchResult.ACCEPTED, stanza=matched,
+                                 confidence=ProvenanceRecord.CONFIDENCE_BOOTSTRAP)
 
 
 def sha256_of_file(path):
