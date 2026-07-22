@@ -318,6 +318,60 @@ def load_provenance_manifest(arch, workdir):
     return {name: ProvenanceRecord.from_dict(d) for name, d in raw.items()}
 
 
+def bulk_fetch_info_and_sha256(arch, workdir):
+    """One-time bulk download of every currently-published pkgs/<arch>/
+    .info and .wsh.sha256 object, instead of ~1-2 sequential B2 GETs PER
+    canonical package during matching. The first real run of this script
+    was network-latency-bound: ~10k packages x up to 2 individual small
+    GETs each (0.4 pkg/s measured) projected to ~7 hours just for the
+    matching phase, blowing well past both the script's own deadline and
+    the GitHub Actions job timeout. `aws s3 sync` pulls an entire prefix
+    in one parallelized operation; everything after this becomes in-memory
+    dict lookups, i.e. CPU-bound, not network-bound.
+
+    Returns (info_map: {name: text}, sha256_map: {wsh_filename: sha256}).
+    Gracefully returns ({}, {}) if sync fails (e.g. no B2 credentials in a
+    local/dry-run context) -- callers fall back to individual lookups
+    returning "no prior content", same as before this optimization."""
+    info_dir = os.path.join(workdir, "bulk-info")
+    sha_dir = os.path.join(workdir, "bulk-sha256")
+    os.makedirs(info_dir, exist_ok=True)
+    os.makedirs(sha_dir, exist_ok=True)
+
+    info_map, sha256_map = {}, {}
+    try:
+        sh(f'aws s3 sync "s3://{B2_BUCKET}/pkgs/{arch}/" "{info_dir}" '
+           f'--endpoint-url {B2_ENDPOINT} --exclude "*" --include "*.info" '
+           f'--no-progress --only-show-errors')
+    except Exception as e:
+        print(f"bulk .info sync failed, falling back to per-package GETs: {e}",
+              file=sys.stderr, flush=True)
+        return info_map, sha256_map
+    for fname in os.listdir(info_dir):
+        if fname.endswith(".info"):
+            with open(os.path.join(info_dir, fname)) as f:
+                info_map[fname[:-len(".info")]] = f.read()
+
+    try:
+        sh(f'aws s3 sync "s3://{B2_BUCKET}/pkgs/{arch}/" "{sha_dir}" '
+           f'--endpoint-url {B2_ENDPOINT} --exclude "*" --include "*.wsh.sha256" '
+           f'--no-progress --only-show-errors')
+    except Exception as e:
+        print(f"bulk .sha256 sync failed, live payload checks will be skipped: {e}",
+              file=sys.stderr, flush=True)
+        return info_map, sha256_map
+    for fname in os.listdir(sha_dir):
+        if fname.endswith(".sha256"):
+            with open(os.path.join(sha_dir, fname)) as f:
+                content = f.read().strip()
+            if content:
+                sha256_map[fname[:-len(".sha256")]] = content.split()[0]
+
+    print(f"[run] {arch}: bulk-fetched {len(info_map)} .info + "
+          f"{len(sha256_map)} .sha256 objects", file=sys.stderr, flush=True)
+    return info_map, sha256_map
+
+
 def stanza_to_record(name, arch, stanza, wsh_filename, payload_sha256):
     return ProvenanceRecord(
         name=name, arch=arch, source_distro=stanza.source_distro,
@@ -347,6 +401,8 @@ class CatalogRebuild:
         self.new_manifest = {}    # name -> ProvenanceRecord, for RESOLVED-and-verified packages
         self.prior_manifest = {}  # name -> ProvenanceRecord, loaded from the last trusted rebuild
         self.canonical_versions = {}
+        self.info_map = {}        # name -> current .info text, bulk-fetched once (see bulk_fetch_info_and_sha256)
+        self.sha256_map = {}      # wsh_filename -> live sha256, bulk-fetched once
 
     def _bump(self, bucket, distro):
         self.report[bucket][distro] = self.report[bucket].get(distro, 0) + 1
@@ -361,6 +417,10 @@ class CatalogRebuild:
 
         stanzas = scan_all_stanzas(self.arch)
 
+        print(f"[run] bulk-fetching current .info/.sha256 objects for {self.arch}...",
+              file=sys.stderr, flush=True)
+        self.info_map, self.sha256_map = bulk_fetch_info_and_sha256(self.arch, self.workdir)
+
         print(f"[run] loading prior provenance manifest for {self.arch}...",
               file=sys.stderr, flush=True)
         self.prior_manifest = load_provenance_manifest(self.arch, self.workdir)
@@ -374,7 +434,15 @@ class CatalogRebuild:
               f"is the slowest phase", file=sys.stderr, flush=True)
 
         processed = 0
+        deadline_stopped = False
         for name, result in manifest.items():
+            if deadline_hit():
+                deadline_stopped = True
+                print(f"[run] {self.arch}: deadline reached at {processed}/"
+                      f"{len(manifest)} -- stopping the matching pass cleanly "
+                      f"(everything already matched stays valid; the rest "
+                      f"reports as unresolved this run)", file=sys.stderr, flush=True)
+                break
             processed += 1
             if processed % 250 == 0:
                 elapsed = time.monotonic() - t_start
@@ -477,6 +545,7 @@ class CatalogRebuild:
         self.report["dependency_classes"] = dep_report
         self.report["orphan_objects"] = orphans
         self.report["provides_pairs"] = sum(len(v) for v in self.provides_index.values())
+        self.report["deadline_stopped"] = deadline_stopped
 
         # Step 11: publish gate -- STRICT. Publishing is allowed only when
         # EVERY canonical package has exactly one proven provenance match
@@ -526,6 +595,13 @@ class CatalogRebuild:
         if canonical_names and not self.staged_info:
             blockers.append("zero packages resolved out of a non-empty "
                              "canonical index (matching logic likely broken)")
+        if self.report.get("deadline_stopped"):
+            blockers.append("the matching pass hit its own deadline before "
+                             "covering every canonical package -- an "
+                             "incomplete pass must never publish (packages "
+                             "past the cutoff would look like new "
+                             "unresolved regressions instead of simply "
+                             "'not reached yet')")
 
         ambiguous_count = sum(self.report["ambiguous"].values())
         if ambiguous_count:
@@ -547,6 +623,16 @@ class CatalogRebuild:
         return blockers
 
     def _fetch_current_info(self, name):
+        # Served from the bulk-fetched map (see bulk_fetch_info_and_sha256)
+        # -- one aws s3 sync at the start of run() instead of a B2 GET per
+        # package. Falls back to an individual GET only if the bulk map
+        # came back empty (e.g. the sync itself failed), so this still
+        # degrades gracefully rather than silently treating "sync failed"
+        # as "nothing has a .info yet".
+        if name in self.info_map:
+            return self.info_map[name]
+        if self.info_map:
+            return None
         tmp = os.path.join(self.workdir, f"cur-{name}.info")
         key = f"pkgs/{self.arch}/{name}.info"
         if b2_get(key, tmp):
@@ -565,12 +651,17 @@ class CatalogRebuild:
     def _fetch_live_payload_sha256(self, name):
         """The sha256 currently published in this package's own
         .wsh.sha256 -- used, where available, as continuity evidence (see
-        verify_continuity). A cheap small-file GET, never a payload
-        re-download."""
+        verify_continuity). Served from the bulk-fetched map (see
+        bulk_fetch_info_and_sha256); falls back to an individual GET only
+        if that map came back empty."""
         version = self.canonical_versions.get(name)
         if version is None:
             return None
         wsh_filename = self._current_wsh_filename(name, version)
+        if wsh_filename in self.sha256_map:
+            return self.sha256_map[wsh_filename]
+        if self.sha256_map:
+            return None
         tmp = os.path.join(self.workdir, f"sha-{wsh_filename}.sha256")
         key = f"pkgs/{self.arch}/{wsh_filename}.sha256"
         if b2_get(key, tmp):
@@ -728,12 +819,85 @@ class CatalogRebuild:
                f'--endpoint-url {B2_ENDPOINT}')
 
 
+def diagnose_ambiguous(arch, sample_size, out_path):
+    """Explains WHY packages are landing as ambiguous, instead of guessing.
+    Runs only the scan + name/version matching (no per-package .info/
+    .sha256 fetches -- those are irrelevant to *why* multiple candidates
+    survived the name+version match, and skipping them keeps this fast
+    enough to run standalone against production). For the first
+    `sample_size` ambiguous canonical packages, dumps every candidate's
+    full identity (source distro/suite/component/arch, upstream name,
+    upstream version, sanitized version, upstream filename) side by side
+    so the actual colliding field(s) are visible instead of assumed."""
+    canonical_versions = load_canonical_versions(arch, tempfile.mkdtemp())
+    print(f"[diagnose] {len(canonical_versions)} canonical packages for {arch}",
+          file=sys.stderr, flush=True)
+    stanzas = scan_all_stanzas(arch)
+    manifest = build_provenance_manifest(canonical_versions, stanzas, arch)
+
+    samples = []
+    for name, result in manifest.items():
+        if result.status != ProvenanceResult.AMBIGUOUS:
+            continue
+        version = canonical_versions[name]
+        candidates = [
+            {
+                "source_distro": c.source_distro,
+                "suite": c.suite,
+                "source_arch": c.source_arch,
+                "component": c.component,
+                "upstream_name": c.upstream_name,
+                "upstream_version": c.upstream_version,
+                "sanitized_version": c.sanitized_version,
+                "upstream_filename": c.upstream_filename,
+            }
+            for c in result.candidates
+        ]
+        # Which fields are actually identical across every candidate --
+        # this is the direct answer to "why do multiple candidates
+        # survive": whatever's listed here is what the current match key
+        # (name+version) cannot distinguish between them on.
+        keys = candidates[0].keys()
+        equal_fields = [k for k in keys if len({c[k] for c in candidates}) == 1]
+        samples.append({
+            "name": name, "canonical_version": version,
+            "equal_fields": equal_fields, "candidates": candidates,
+        })
+        if len(samples) >= sample_size:
+            break
+
+    total_ambiguous = sum(1 for r in manifest.values()
+                           if r.status == ProvenanceResult.AMBIGUOUS)
+    out = {
+        "arch": arch,
+        "total_canonical": len(canonical_versions),
+        "total_ambiguous": total_ambiguous,
+        "ambiguous_fraction": total_ambiguous / len(canonical_versions) if canonical_versions else 0,
+        "samples": samples,
+    }
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2, sort_keys=True)
+    print(f"[diagnose] {arch}: {total_ambiguous}/{len(canonical_versions)} "
+          f"({out['ambiguous_fraction']:.1%}) ambiguous; wrote "
+          f"{len(samples)}-package sample to {out_path}", file=sys.stderr, flush=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", required=True, choices=["aarch64", "x86_64"])
     ap.add_argument("--publish", action="store_true")
     ap.add_argument("--report-dir", default=".")
+    ap.add_argument("--diagnose-ambiguous", type=int, metavar="N", default=0,
+                     help="Instead of a full run, sample N ambiguous packages "
+                          "and explain exactly why each is ambiguous, then exit.")
     args = ap.parse_args()
+
+    if args.diagnose_ambiguous:
+        os.makedirs(args.report_dir, exist_ok=True)
+        out_path = os.path.join(args.report_dir, f"ambiguous-diagnosis-{args.arch}.json")
+        diagnose_ambiguous(args.arch, args.diagnose_ambiguous, out_path)
+        return
 
     workdir = tempfile.mkdtemp()
     rebuild = CatalogRebuild(args.arch, workdir, publish=args.publish)

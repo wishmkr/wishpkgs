@@ -24,6 +24,10 @@ on:
         description: "Attempt to publish (strict gate still applies; false = report-only)"
         type: boolean
         default: false
+      diagnose_ambiguous:
+        description: "Sample size for ambiguous-match diagnosis instead of a full run (0 = normal run)"
+        type: number
+        default: 0
 
 permissions:
   contents: read
@@ -61,7 +65,9 @@ jobs:
         working-directory: tools
         run: |
           ARGS="--arch ${{ matrix.arch }} --report-dir ../repair-reports"
-          if [ "${{ inputs.publish }}" = "true" ]; then
+          if [ "${{ inputs.diagnose_ambiguous }}" != "0" ]; then
+            ARGS="$ARGS --diagnose-ambiguous ${{ inputs.diagnose_ambiguous }}"
+          elif [ "${{ inputs.publish }}" = "true" ]; then
             ARGS="$ARGS --publish"
           fi
           python3 rebuild_catalog.py $ARGS
@@ -69,5 +75,7 @@ jobs:
         if: always()
         with:
           name: repair-report-${{ matrix.arch }}
-          path: repair-reports/repair-report-${{ matrix.arch }}.json
+          path: |
+            repair-reports/repair-report-${{ matrix.arch }}.json
+            repair-reports/ambiguous-diagnosis-${{ matrix.arch }}.json
           if-no-files-found: warn
