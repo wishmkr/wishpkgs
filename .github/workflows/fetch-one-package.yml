@@ -58,7 +58,13 @@ jobs:
           print(f"Found: {match['Package']} {match['Version']}")
           import tempfile, os
           workdir = tempfile.mkdtemp()
-          wsh_name = m.process_package(arch_wish, cfg["base"], match, workdir)
+          # process_package() returns (wsh_filename, provides_list) -- this
+          # script wasn't updated when that changed from a bare filename
+          # earlier in the project, so it was unpacking the whole tuple
+          # into wsh_name and then crashing trying to hash it into a set
+          # ("unhashable type: 'list'") right after the real upload had
+          # already succeeded.
+          wsh_name, provides = m.process_package(arch_wish, cfg["base"], match, workdir)
           if not wsh_name:
               print("process_package failed", file=sys.stderr)
               sys.exit(1)
@@ -79,6 +85,25 @@ jobs:
                   f.writelines(f"{l}\n" for l in sorted(lines))
               m.b2_cp(tmp, key)
               print(f"updated {key}")
+
+          # publish this package's own Provides too, single-writer (this
+          # script only ever fetches one package per invocation, so no
+          # concurrent-shard race to worry about here).
+          if provides:
+              tmp = os.path.join(workdir, "provides")
+              provides_key = f"index/{arch_wish}-provides.txt"
+              m.b2_get(provides_key, tmp)
+              lines = set()
+              if os.path.exists(tmp):
+                  with open(tmp) as f:
+                      lines.update(l.strip() for l in f if l.strip())
+              import mirror_common as mc
+              real_name = mc.parse_name_from_index_line(wsh_name) or match["Package"]
+              lines.update(f"{v} {real_name}" for v in provides)
+              with open(tmp, "w") as f:
+                  f.writelines(f"{l}\n" for l in sorted(lines))
+              m.b2_cp(tmp, provides_key)
+              print(f"updated {provides_key} ({len(provides)} provides)")
 
           # mark done in that shard's state so the regular pipeline skips it later
           uid = f"{match['Package']}={match['Version']}"
