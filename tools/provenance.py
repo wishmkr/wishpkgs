@@ -41,16 +41,18 @@ class ProvenanceRecord:
     # A record's confidence tier -- NEVER conflate these. "verified" means
     # match_provenance found exactly one upstream stanza by name+version
     # (optionally strengthened by verify_continuity against prior history).
-    # "bootstrap_live_info_match" means the name+version match was
+    # "bootstrap_semantic_match" means the name+version match was
     # genuinely ambiguous (2+ distinct upstream sources), and was ONLY
-    # accepted because exactly one candidate's freshly-rendered .info was
-    # byte-identical to what's already live -- corroborating evidence, not
-    # proof of which upstream source actually produced the payload. A
-    # future run with stronger evidence (e.g. this same package resolving
-    # unambiguously once upstream versions diverge) should upgrade a
-    # bootstrap record to verified, never the reverse.
+    # accepted because exactly one candidate's normalized identity+
+    # relationship fingerprint (name/arch/version/depends/pre-depends/
+    # provides/conflicts/breaks/replaces/essential/multi-arch -- NOT free
+    # text like description) matched what's already live -- corroborating
+    # evidence, not proof of which upstream source actually produced the
+    # payload. A future run with stronger evidence (e.g. this same package
+    # resolving unambiguously once upstream versions diverge) should
+    # upgrade a bootstrap record to verified, never the reverse.
     CONFIDENCE_VERIFIED = "verified"
-    CONFIDENCE_BOOTSTRAP = "bootstrap_live_info_match"
+    CONFIDENCE_BOOTSTRAP = "bootstrap_semantic_match"
 
     __slots__ = (
         "name", "arch", "source_distro", "suite", "source_arch",
@@ -294,10 +296,49 @@ def is_suspicious_contamination_order(matched_stanza, all_candidates):
     return False
 
 
-def try_bootstrap_match(name, candidates, live_info_text, excluded_names,
-                         render_fn):
+# The identity+relationship fields a semantic fingerprint compares.
+# Deliberately excludes free-text fields (description, maintainer,
+# homepage, section) that carry no relationship semantics and are the
+# most likely to drift in wording/formatting between when a package was
+# originally mirrored and today's rendering -- byte-for-byte comparison
+# against these was the reason the first bootstrap attempt (comparing
+# full rendered .info text) matched almost nothing: real packages, real
+# provenance, but a stale description or reordered field made the exact
+# string differ. Fields not representable on one side (e.g. wish's own
+# .info format has never stored Pre-Depends/Replaces/Essential/Multi-Arch)
+# are carried as None and skipped during comparison rather than forced
+# into a false mismatch -- see fingerprints_semantically_equal.
+FINGERPRINT_FIELDS = (
+    "name", "architecture", "version", "depends", "pre_depends",
+    "provides", "conflicts", "breaks", "replaces", "essential",
+    "multi_arch",
+)
+
+
+def fingerprints_semantically_equal(a, b):
+    """Two fingerprint dicts (see FINGERPRINT_FIELDS) are semantically
+    equal when every field present (non-None) on BOTH sides is equal.
+    A field that's None on either side (not representable there, e.g.
+    Pre-Depends against wish's own .info format, which never stored it)
+    is simply not compared -- neither counted as a match nor a mismatch.
+    Empty-vs-missing is already collapsed to the same normalized empty
+    value by whichever function BUILT the fingerprint (see
+    rebuild_catalog.semantic_fingerprint_from_stanza /
+    _from_live_info) -- this function only ever sees the two dicts, it
+    doesn't re-normalize."""
+    for key in FINGERPRINT_FIELDS:
+        va, vb = a.get(key), b.get(key)
+        if va is None or vb is None:
+            continue
+        if va != vb:
+            return False
+    return True
+
+
+def try_bootstrap_match(name, candidates, live_fingerprint, excluded_names,
+                         fingerprint_fn):
     """Attempts to disambiguate an AMBIGUOUS provenance match (see
-    match_provenance) using byte-for-byte comparison against the
+    match_provenance) using a semantic fingerprint comparison against the
     currently-published .info -- NOT a guess: corroborating evidence, not
     proof. Only ever used as a BOOTSTRAP mechanism (no prior trusted
     manifest exists yet to check continuity against via verify_continuity)
@@ -305,27 +346,34 @@ def try_bootstrap_match(name, candidates, live_info_text, excluded_names,
     versions have since diverged), the normal verified path takes over and
     this is never consulted again for it.
 
-    Compares ALL semantic fields (description/license/depends/provides/
-    conflicts/breaks) via `render_fn` (the same rendering every candidate
-    would use to actually regenerate its .info), not dependencies alone.
+    Compares normalized package identity + relationship fields only (see
+    FINGERPRINT_FIELDS) -- name, architecture, normalized version,
+    depends, pre-depends, provides, conflicts, breaks, replaces,
+    essential, multi-arch -- NOT free-text fields like description, and
+    NOT sensitive to field order, whitespace, or empty-vs-missing
+    differences (that normalization happens in whoever builds the
+    fingerprints; see rebuild_catalog.semantic_fingerprint_from_stanza).
+    `fingerprint_fn(stanza)` builds a candidate's fingerprint the same way
+    `live_fingerprint` was built for the live side, so both are directly
+    comparable.
 
     Accepts a candidate only when:
       - the package name isn't in `excluded_names` (known-contaminated or
         manually-repaired packages, whose live .info might itself be
         exactly the kind of content a bootstrap match would wrongly trust
         -- see CatalogRebuild._load_bootstrap_exclusions),
-      - `live_info_text` exists (nothing to corroborate against otherwise),
-      - EXACTLY ONE candidate's rendered .info matches live_info_text
-        (normalized: trailing whitespace stripped on both sides) -- zero
-        or multiple matches both stay ambiguous, never guessed between,
+      - `live_fingerprint` exists (nothing to corroborate against otherwise),
+      - EXACTLY ONE candidate's fingerprint is semantically equal to
+        live_fingerprint -- zero or multiple matches both stay ambiguous,
+        never guessed between,
       - the match isn't flagged by is_suspicious_contamination_order.
 
     Returns (stanza, ProvenanceRecord.CONFIDENCE_BOOTSTRAP) on acceptance,
     or (None, None) otherwise."""
-    if name in excluded_names or live_info_text is None:
+    if name in excluded_names or live_fingerprint is None:
         return None, None
-    normalized_live = live_info_text.strip()
-    matches = [c for c in candidates if render_fn(c).strip() == normalized_live]
+    matches = [c for c in candidates
+               if fingerprints_semantically_equal(fingerprint_fn(c), live_fingerprint)]
     if len(matches) != 1:
         return None, None
     matched = matches[0]

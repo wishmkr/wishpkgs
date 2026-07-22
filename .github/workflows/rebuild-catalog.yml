@@ -28,6 +28,14 @@ on:
         description: "Sample size for ambiguous-match diagnosis instead of a full run (0 = normal run)"
         type: number
         default: 0
+      evaluate_bootstrap:
+        description: "Sample size to evaluate semantic-fingerprint bootstrap matching instead of a full run (0 = normal run)"
+        type: number
+        default: 0
+      classify_orphans:
+        description: "Classify orphan objects by type instead of a full run (read-only, no quarantine/delete)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -67,6 +75,10 @@ jobs:
           ARGS="--arch ${{ matrix.arch }} --report-dir ../repair-reports"
           if [ "${{ inputs.diagnose_ambiguous }}" != "0" ]; then
             ARGS="$ARGS --diagnose-ambiguous ${{ inputs.diagnose_ambiguous }}"
+          elif [ "${{ inputs.evaluate_bootstrap }}" != "0" ]; then
+            ARGS="$ARGS --evaluate-bootstrap ${{ inputs.evaluate_bootstrap }}"
+          elif [ "${{ inputs.classify_orphans }}" = "true" ]; then
+            ARGS="$ARGS --classify-orphans"
           elif [ "${{ inputs.publish }}" = "true" ]; then
             ARGS="$ARGS --publish"
           fi
@@ -78,4 +90,6 @@ jobs:
           path: |
             repair-reports/repair-report-${{ matrix.arch }}.json
             repair-reports/ambiguous-diagnosis-${{ matrix.arch }}.json
+            repair-reports/bootstrap-evaluation-${{ matrix.arch }}.json
+            repair-reports/orphan-classification-${{ matrix.arch }}.json
           if-no-files-found: warn

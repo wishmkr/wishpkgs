@@ -447,26 +447,40 @@ class ContinuityVerificationTests(unittest.TestCase):
         self.assertFalse(report["published"])
 
 
-class BootstrapLiveInfoMatchTests(unittest.TestCase):
-    """The bootstrap disambiguation mechanism: an ambiguous name+version
-    match may still be accepted if EXACTLY ONE candidate's freshly
-    rendered .info is byte-identical to what's already live -- and only
-    ever recorded at CONFIDENCE_BOOTSTRAP, never verified."""
+class BootstrapSemanticMatchTests(unittest.TestCase):
+    """The bootstrap disambiguation mechanism (rewritten after review):
+    an ambiguous name+version match may still be accepted if EXACTLY ONE
+    candidate's normalized identity+relationship FINGERPRINT (depends/
+    provides/conflicts/breaks/etc -- explicitly NOT free text like
+    description) matches what's already live -- and only ever recorded at
+    CONFIDENCE_BOOTSTRAP ("bootstrap_semantic_match"), never verified."""
 
-    def _ambiguous_pair(self, ubuntu_desc="same content", debian_desc="same content"):
+    def _ambiguous_pair(self, ubuntu_depends="", debian_depends="",
+                         ubuntu_desc="alpha variant", debian_desc="beta variant"):
         u = stanza("ubuntu", "noble", "arm64", "main", "shared-pkg", "1.0-1ubuntu1",
                    raw={"Package": "shared-pkg", "Version": "1.0-1ubuntu1",
-                        "Depends": "", "Provides": "", "Conflicts": "", "Breaks": "",
-                        "Description": ubuntu_desc})
+                        "Depends": ubuntu_depends, "Provides": "", "Conflicts": "",
+                        "Breaks": "", "Description": ubuntu_desc})
         d = stanza("debian", "bookworm", "arm64", "main", "shared-pkg", "1.0-1",
                    raw={"Package": "shared-pkg", "Version": "1.0-1",
-                        "Depends": "", "Provides": "", "Conflicts": "", "Breaks": "",
-                        "Description": debian_desc})
+                        "Depends": debian_depends, "Provides": "", "Conflicts": "",
+                        "Breaks": "", "Description": debian_desc})
         return u, d
 
-    def test_unique_content_match_is_accepted_as_bootstrap(self):
-        u, d = self._ambiguous_pair(ubuntu_desc="the real content")
-        live_info = rc.render_info_from_stanza(u)  # matches Ubuntu's rendering only
+    def _live_info_for(self, matching_stanza):
+        """Builds a plausible already-published .info string whose
+        depends= line matches `matching_stanza`'s Depends -- standing in
+        for "this is what got mirrored in, long ago, by whichever distro
+        really produced it", independent of description wording."""
+        depends_field = rc.format_dep_field(rc.parse_dep_field(matching_stanza.raw["Depends"]))
+        lines = ["description=some historical wording, possibly stale", "license=x"]
+        if depends_field:
+            lines.append(f"depends={depends_field}")
+        return "\n".join(lines) + "\n"
+
+    def test_unique_semantic_match_is_accepted_as_bootstrap(self):
+        u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1")
+        live_info = self._live_info_for(u)  # depends=libfoo1 -- matches only Ubuntu
 
         rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
         rc.scan_all_stanzas = lambda arch: [u, d]
@@ -481,12 +495,48 @@ class BootstrapLiveInfoMatchTests(unittest.TestCase):
         self.assertIn("shared-pkg", rebuild.staged_info)
         record = rebuild.new_manifest["shared-pkg"]
         self.assertEqual(record.confidence, rc.ProvenanceRecord.CONFIDENCE_BOOTSTRAP)
+        self.assertEqual(record.confidence, "bootstrap_semantic_match")
         self.assertNotEqual(record.confidence, rc.ProvenanceRecord.CONFIDENCE_VERIFIED)
         self.assertEqual(record.source_distro, "ubuntu")
 
-    def test_no_content_match_stays_ambiguous(self):
-        u, d = self._ambiguous_pair()
-        live_info = "description=neither candidate wrote this\nlicense=x\n"
+    def test_description_differences_are_ignored(self):
+        # Same Depends on both sides as the live info, but DESCRIPTION
+        # differs from both candidates -- must still match on the
+        # relationship fields alone (free text is excluded from the
+        # fingerprint entirely).
+        u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1",
+                                     ubuntu_desc="completely different wording than live")
+        live_info = self._live_info_for(u)
+
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: live_info
+        rebuild._find_orphans = lambda names: []
+
+        report = rebuild.run()
+        self.assertEqual(sum(report["bootstrap_matched"].values()), 1)
+
+    def test_or_group_alternative_order_does_not_matter(self):
+        # "A|B" and "B|A" are the same OR-group semantically.
+        u, d = self._ambiguous_pair(ubuntu_depends="libfoo1|libbar1", debian_depends="something-else")
+        live_info = self._live_info_for(
+            rc.UpstreamStanza(u.source_distro, u.suite, u.source_arch, u.component,
+                               u.upstream_name, u.upstream_version, u.sanitized_name,
+                               u.sanitized_version,
+                               raw={"Depends": "libbar1|libfoo1"},  # reversed order
+                               wish_arch=u.wish_arch))
+
+        matched, confidence = rc.try_bootstrap_match(
+            "shared-pkg", [u, d],
+            rc.semantic_fingerprint_from_live_info("shared-pkg", "aarch64", "1.0", live_info),
+            set(), rc.semantic_fingerprint_from_stanza)
+        self.assertIs(matched, u)
+        self.assertEqual(confidence, rc.ProvenanceRecord.CONFIDENCE_BOOTSTRAP)
+
+    def test_no_semantic_match_stays_ambiguous(self):
+        u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1")
+        live_info = "description=x\nlicense=x\ndepends=libneither1\n"
 
         rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
         rc.scan_all_stanzas = lambda arch: [u, d]
@@ -501,10 +551,10 @@ class BootstrapLiveInfoMatchTests(unittest.TestCase):
         self.assertNotIn("shared-pkg", rebuild.staged_info)
 
     def test_both_candidates_matching_identically_stays_ambiguous(self):
-        # Identical rendered content from BOTH candidates (e.g. genuinely
-        # identical packaging) -- multiple matches, never guess between them.
-        u, d = self._ambiguous_pair(ubuntu_desc="same", debian_desc="same")
-        live_info = rc.render_info_from_stanza(u)  # == render(d) too, by construction
+        # Identical Depends on both sides (e.g. genuinely identical
+        # packaging) -- multiple matches, never guess between them.
+        u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libfoo1")
+        live_info = self._live_info_for(u)  # == live_info_for(d) too, by construction
 
         rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
         rc.scan_all_stanzas = lambda arch: [u, d]
@@ -517,9 +567,9 @@ class BootstrapLiveInfoMatchTests(unittest.TestCase):
         self.assertEqual(sum(report["bootstrap_matched"].values()), 0)
         self.assertEqual(sum(report["ambiguous"].values()), 1)
 
-    def test_excluded_package_never_bootstrap_matched_even_with_unique_content_match(self):
-        u, d = self._ambiguous_pair(ubuntu_desc="the real content")
-        live_info = rc.render_info_from_stanza(u)
+    def test_excluded_package_never_bootstrap_matched_even_with_unique_match(self):
+        u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1")
+        live_info = self._live_info_for(u)
 
         rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
         rc.scan_all_stanzas = lambda arch: [u, d]
@@ -538,12 +588,15 @@ class BootstrapLiveInfoMatchTests(unittest.TestCase):
         # HISTORICAL_BACKFILL_ORDER) is ALSO a candidate that doesn't
         # match -- this is exactly the shape the historical "later distro
         # silently overwrote an earlier one" bug would produce, so it must
-        # be rejected even though the name+content match is otherwise clean.
-        u, d = self._ambiguous_pair(ubuntu_desc="alpha variant", debian_desc="beta variant")
-        live_info = rc.render_info_from_stanza(d)  # only matches Debian
+        # be rejected even though the name+fingerprint match is otherwise
+        # clean.
+        u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1")
+        live_info = self._live_info_for(d)  # only matches Debian
 
         matched, confidence = rc.try_bootstrap_match(
-            "shared-pkg", [u, d], live_info, set(), rc.render_info_from_stanza)
+            "shared-pkg", [u, d],
+            rc.semantic_fingerprint_from_live_info("shared-pkg", "aarch64", "1.0", live_info),
+            set(), rc.semantic_fingerprint_from_stanza)
         self.assertIsNone(matched)
         self.assertIsNone(confidence)
 
@@ -551,11 +604,13 @@ class BootstrapLiveInfoMatchTests(unittest.TestCase):
         # Symmetric case: Ubuntu (earliest in the order) is the one that
         # matches -- nothing "later" could have overwritten it, so this is
         # legitimate and must be accepted.
-        u, d = self._ambiguous_pair(ubuntu_desc="alpha variant", debian_desc="beta variant")
-        live_info = rc.render_info_from_stanza(u)  # only matches Ubuntu
+        u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1")
+        live_info = self._live_info_for(u)  # only matches Ubuntu
 
         matched, confidence = rc.try_bootstrap_match(
-            "shared-pkg", [u, d], live_info, set(), rc.render_info_from_stanza)
+            "shared-pkg", [u, d],
+            rc.semantic_fingerprint_from_live_info("shared-pkg", "aarch64", "1.0", live_info),
+            set(), rc.semantic_fingerprint_from_stanza)
         self.assertIs(matched, u)
         self.assertEqual(confidence, rc.ProvenanceRecord.CONFIDENCE_BOOTSTRAP)
 
@@ -564,8 +619,13 @@ class BootstrapLiveInfoMatchTests(unittest.TestCase):
         # fully-clean catalog publish despite genuine cross-distro
         # name+version collisions -- a bootstrap-tier record must not
         # itself count as a blocker.
-        u, d = self._ambiguous_pair(ubuntu_desc="the real content")
-        live_info = rc.render_info_from_stanza(u)
+        # Empty Depends deliberately -- isolates "does bootstrap matching
+        # itself block publish" from the unrelated dependency-
+        # classification gate (a non-canonical, non-provided,
+        # non-excluded "libfoo1" dependency would trip THAT gate too,
+        # muddying what this test is actually checking).
+        u, d = self._ambiguous_pair(ubuntu_depends="", debian_depends="libbar1")
+        live_info = self._live_info_for(u)
 
         rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=True)
         rc.scan_all_stanzas = lambda arch: [u, d]

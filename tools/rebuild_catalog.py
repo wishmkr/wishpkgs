@@ -69,6 +69,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mirror_common import (
@@ -79,7 +80,7 @@ from mirror_common import (
 )
 from provenance import (
     UpstreamStanza, match_provenance, ProvenanceResult, ProvenanceRecord,
-    verify_continuity, try_bootstrap_match,
+    verify_continuity, try_bootstrap_match, fingerprints_semantically_equal,
 )
 
 import mirror_ubuntu
@@ -303,6 +304,115 @@ def parse_info_depends(info_text):
     return []
 
 
+# ---------------------------------------------------------------------
+# Semantic fingerprints for bootstrap disambiguation (see
+# provenance.try_bootstrap_match / fingerprints_semantically_equal).
+# Compares normalized package identity + relationship fields ONLY --
+# never free text like description/maintainer/homepage/section, which is
+# exactly the kind of field that drifts in wording/formatting between when
+# a package was originally mirrored and today's rendering without the
+# underlying package actually being any different.
+# ---------------------------------------------------------------------
+
+def _normalize_dep_groups_semantic(groups):
+    """`groups`: parse_dep_field()'s shape -- a list of OR-groups, each a
+    list of (name, op, version) tuples. Normalizes to a frozenset of
+    frozensets so that: comma-separated slot ORDER doesn't matter (AND is
+    order-independent), '|' alternative ORDER within one slot doesn't
+    matter ("A|B" == "B|A"), and version constraints are normalized via
+    sanitize_version. Empty/missing both normalize to frozenset() (never
+    None), so this field always participates in comparison -- "ignore
+    empty-vs-missing differences" without ever silently skipping a real
+    relationship field."""
+    out = set()
+    for group in groups:
+        alts = frozenset(
+            (sanitize_name(name), op, sanitize_version(version) if version else "")
+            for name, op, version in group
+        )
+        if alts:
+            out.add(alts)
+    return frozenset(out)
+
+
+def _normalize_provides_semantic(names):
+    return frozenset(sanitize_name(n) for n in names if n)
+
+
+def _get_raw_field(info_text, key):
+    prefix = f"{key}="
+    for line in info_text.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):]
+    return ""
+
+
+def semantic_fingerprint_from_stanza(stanza):
+    """Builds a candidate's fingerprint straight from the raw upstream
+    stanza -- the richest side, since the full upstream control/primary.xml
+    data is available. Fields the upstream format doesn't have (e.g.
+    Fedora/RPM has no Debian-style Pre-Depends/Essential/Multi-Arch/
+    Replaces concept) are left None, not forced to a false empty value --
+    None means "not comparable here", not "empty", see
+    fingerprints_semantically_equal."""
+    pkg = stanza.raw
+    fp = {
+        "name": stanza.sanitized_name,
+        "architecture": stanza.wish_arch,
+        "version": stanza.sanitized_version,
+    }
+    if stanza.source_distro in ("ubuntu", "debian"):
+        fp["depends"] = _normalize_dep_groups_semantic(parse_dep_field(pkg.get("Depends", "")))
+        fp["pre_depends"] = _normalize_dep_groups_semantic(parse_dep_field(pkg.get("Pre-Depends", "")))
+        fp["provides"] = _normalize_provides_semantic(
+            provides_names(parse_dep_field(pkg.get("Provides", ""))))
+        fp["conflicts"] = _normalize_dep_groups_semantic(parse_dep_field(pkg.get("Conflicts", "")))
+        fp["breaks"] = _normalize_dep_groups_semantic(parse_dep_field(pkg.get("Breaks", "")))
+        fp["replaces"] = _normalize_dep_groups_semantic(parse_dep_field(pkg.get("Replaces", "")))
+        essential = (pkg.get("Essential") or "").strip().lower()
+        fp["essential"] = essential or "no"  # Debian's own default when the field is absent
+        multi_arch = (pkg.get("Multi-Arch") or "").strip().lower()
+        fp["multi_arch"] = multi_arch or None
+    elif stanza.source_distro == "fedora":
+        fp["depends"] = _normalize_dep_groups_semantic(rpm_entries_to_groups(pkg["requires"]))
+        fp["pre_depends"] = None
+        fp["provides"] = _normalize_provides_semantic(
+            provides_names(rpm_entries_to_groups(pkg["provides"])))
+        fp["conflicts"] = _normalize_dep_groups_semantic(rpm_entries_to_groups(pkg["conflicts"]))
+        fp["breaks"] = None
+        fp["replaces"] = None
+        fp["essential"] = None
+        fp["multi_arch"] = None
+    else:
+        raise ValueError(f"unknown source_distro {stanza.source_distro!r}")
+    return fp
+
+
+def semantic_fingerprint_from_live_info(name, arch, version, info_text):
+    """Builds the live side's fingerprint by parsing the ALREADY-PUBLISHED
+    .info text. wish's .info wire format only ever stores
+    depends/provides/conflicts/breaks -- it has never captured Pre-Depends/
+    Replaces/Essential/Multi-Arch, so those come back None (not
+    comparable) here, same as Fedora candidates. This is a real, current
+    limitation of the .info format, not a bug in the comparison: it means
+    those four fields can only ever help disambiguate once/if the format
+    is extended to store them."""
+    return {
+        "name": name,
+        "architecture": arch,
+        "version": version,
+        "depends": _normalize_dep_groups_semantic(parse_dep_field(_get_raw_field(info_text, "depends"))),
+        "pre_depends": None,
+        "provides": _normalize_provides_semantic(
+            [p.strip() for p in _get_raw_field(info_text, "provides").split(",") if p.strip()]),
+        "conflicts": _normalize_dep_groups_semantic(parse_dep_field(_get_raw_field(info_text, "conflicts"))),
+        "breaks": _normalize_dep_groups_semantic(parse_dep_field(_get_raw_field(info_text, "breaks"))),
+        "replaces": None,
+        "essential": None,
+        "multi_arch": None,
+    }
+
+
 def load_provenance_manifest(arch, workdir):
     """The provenance manifest published by the last TRUSTED rebuild for
     this arch -- {name: ProvenanceRecord}. Absent on a catalog's first
@@ -470,19 +580,27 @@ class CatalogRebuild:
                 continue
             if result.status == ProvenanceResult.AMBIGUOUS:
                 # Genuinely ambiguous by name+version+arch alone -- before
-                # giving up, try bootstrap disambiguation via byte-for-byte
-                # comparison against the already-live .info (see
-                # tools/provenance.try_bootstrap_match). This is NOT a
-                # guess: it only accepts when exactly one candidate's
-                # freshly-rendered metadata matches what's already
-                # published, corroborating (not proving) that candidate's
-                # identity, excludes known-contaminated packages outright,
-                # and refuses matches that fit the historical cross-distro
-                # contamination bug's own signature.
+                # giving up, try bootstrap disambiguation via a semantic
+                # identity+relationship fingerprint against the already-
+                # live .info (see tools/provenance.try_bootstrap_match).
+                # This is NOT a guess: it only accepts when exactly one
+                # candidate's normalized depends/pre-depends/provides/
+                # conflicts/breaks/replaces/essential/multi-arch fields
+                # match what's already published -- free-text fields like
+                # description are deliberately excluded (they're what made
+                # an earlier byte-for-byte attempt match almost nothing:
+                # real provenance, but wording drift). Excludes known-
+                # contaminated packages outright, and refuses matches that
+                # fit the historical cross-distro contamination bug's own
+                # signature.
                 live_info = self._fetch_current_info(name)
+                live_fingerprint = (
+                    semantic_fingerprint_from_live_info(
+                        name, self.arch, canonical_versions[name], live_info)
+                    if live_info is not None else None)
                 bootstrap_stanza, confidence = try_bootstrap_match(
-                    name, result.candidates, live_info, bootstrap_excluded,
-                    render_info_from_stanza)
+                    name, result.candidates, live_fingerprint, bootstrap_excluded,
+                    semantic_fingerprint_from_stanza)
                 if bootstrap_stanza is None:
                     distros = ",".join(sorted({c.source_distro for c in result.candidates}))
                     self._bump("ambiguous", distros)
@@ -933,6 +1051,174 @@ def diagnose_ambiguous(arch, sample_size, out_path):
     return out
 
 
+def evaluate_bootstrap_semantic(arch, sample_size, out_path):
+    """Dry-run evaluation of the semantic-fingerprint bootstrap mechanism
+    against a SAMPLE of real ambiguous packages, before trusting it against
+    the whole catalog. For each sampled ambiguous package: attempts the
+    same try_bootstrap_match() the real run uses, and buckets the outcome
+    as accepted / zero_match / multi_match / contamination_blocked.
+    "False matches" have no automatic ground truth -- every ACCEPTED
+    match's full candidate identity (source distro/suite/component/
+    version, and which fingerprint fields existed on each side) is
+    reported in full for manual audit, not just a count."""
+    workdir = tempfile.mkdtemp()
+    canonical_versions = load_canonical_versions(arch, workdir)
+    print(f"[evaluate] {len(canonical_versions)} canonical packages for {arch}",
+          file=sys.stderr, flush=True)
+    stanzas = scan_all_stanzas(arch)
+    info_map, _ = bulk_fetch_info_and_sha256(arch, workdir)
+    print(f"[evaluate] {len(info_map)} live .info objects bulk-fetched",
+          file=sys.stderr, flush=True)
+    manifest = build_provenance_manifest(canonical_versions, stanzas, arch)
+
+    buckets = {"accepted": [], "zero_match": [], "multi_match": [],
+               "contamination_blocked": []}
+    checked = 0
+    for name, result in manifest.items():
+        if result.status != ProvenanceResult.AMBIGUOUS:
+            continue
+        if checked >= sample_size:
+            break
+        checked += 1
+
+        live_info = info_map.get(name)
+        live_fp = (semantic_fingerprint_from_live_info(
+                       name, arch, canonical_versions[name], live_info)
+                   if live_info is not None else None)
+        candidates = result.candidates
+        raw_matches = ([c for c in candidates
+                        if fingerprints_semantically_equal(
+                            semantic_fingerprint_from_stanza(c), live_fp)]
+                       if live_fp is not None else [])
+
+        detail = {
+            "name": name, "canonical_version": canonical_versions[name],
+            "candidate_count": len(candidates),
+            "candidate_distros": sorted({c.source_distro for c in candidates}),
+            "raw_match_count": len(raw_matches),
+            "raw_match_distros": sorted({c.source_distro for c in raw_matches}),
+        }
+
+        if live_fp is None:
+            detail["reason"] = "no live .info to compare against"
+            buckets["zero_match"].append(detail)
+            continue
+        if len(raw_matches) == 0:
+            buckets["zero_match"].append(detail)
+            continue
+        if len(raw_matches) > 1:
+            buckets["multi_match"].append(detail)
+            continue
+
+        matched, confidence = try_bootstrap_match(
+            name, candidates, live_fp, set(), semantic_fingerprint_from_stanza)
+        if matched is None:
+            detail["reason"] = "contamination-order heuristic rejected the match"
+            detail["would_have_matched_distro"] = raw_matches[0].source_distro
+            buckets["contamination_blocked"].append(detail)
+            continue
+
+        detail["accepted_distro"] = matched.source_distro
+        detail["accepted_suite"] = matched.suite
+        detail["accepted_component"] = matched.component
+        detail["accepted_upstream_version"] = matched.upstream_version
+        detail["confidence"] = confidence
+        buckets["accepted"].append(detail)
+
+    out = {
+        "arch": arch,
+        "sample_size_requested": sample_size,
+        "sample_size_checked": checked,
+        "accepted": len(buckets["accepted"]),
+        "zero_match": len(buckets["zero_match"]),
+        "multi_match": len(buckets["multi_match"]),
+        "contamination_blocked": len(buckets["contamination_blocked"]),
+        "accepted_detail": buckets["accepted"],
+        "zero_match_detail": buckets["zero_match"][:30],
+        "multi_match_detail": buckets["multi_match"][:30],
+        "contamination_blocked_detail": buckets["contamination_blocked"],
+    }
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2, sort_keys=True)
+    print(f"[evaluate] {arch}: of {checked} sampled ambiguous packages -- "
+          f"accepted={len(buckets['accepted'])} "
+          f"zero_match={len(buckets['zero_match'])} "
+          f"multi_match={len(buckets['multi_match'])} "
+          f"contamination_blocked={len(buckets['contamination_blocked'])}; "
+          f"wrote {out_path}", file=sys.stderr, flush=True)
+    return out
+
+
+def classify_orphans(arch, out_path):
+    """Read-only: lists every object under pkgs/<arch>/, classifies each
+    orphan NAME (no matching canonical index entry) by which of its
+    .info/.wsh/.wsh.sha256 siblings actually exist, and totals their
+    storage size. Deliberately does NOT quarantine or delete anything --
+    this is purely for deciding what to do with each pattern before any
+    destructive action, per the request to classify aarch64's orphans
+    (1018 found, vs x86_64's 33 -- a large enough gap to want a breakdown,
+    not a blind sweep) before touching them."""
+    workdir = tempfile.mkdtemp()
+    canonical_versions = load_canonical_versions(arch, workdir)
+    canonical_names = set(canonical_versions)
+
+    prefix = f"pkgs/{arch}/"
+    r = subprocess.run(
+        f'aws s3 ls "s3://{B2_BUCKET}/{prefix}" --endpoint-url {B2_ENDPOINT}',
+        shell=True, capture_output=True, text=True, check=True)
+
+    by_name = {}
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        fname = parts[-1]
+        size_str = parts[-2] if len(parts) >= 4 else None
+        if fname.endswith(".info"):
+            name, kind = fname[:-len(".info")], "info"
+        elif fname.endswith(".wsh.sha256"):
+            name, kind = parse_name_from_index_line(fname[:-len(".sha256")]), "sha256"
+        elif fname.endswith(".wsh"):
+            name, kind = parse_name_from_index_line(fname), "wsh"
+        else:
+            continue
+        if not name:
+            continue
+        entry = by_name.setdefault(name, {"info": False, "wsh": False,
+                                           "sha256": False, "size_bytes": 0})
+        entry[kind] = True
+        if size_str and size_str.isdigit():
+            entry["size_bytes"] += int(size_str)
+
+    orphan_names = {n: v for n, v in by_name.items() if n not in canonical_names}
+
+    pattern_counts = Counter()
+    pattern_bytes = Counter()
+    pattern_samples = {}
+    for name, v in orphan_names.items():
+        pattern = f"info={v['info']},wsh={v['wsh']},sha256={v['sha256']}"
+        pattern_counts[pattern] += 1
+        pattern_bytes[pattern] += v["size_bytes"]
+        pattern_samples.setdefault(pattern, []).append(name)
+
+    result = {
+        "arch": arch,
+        "total_objects_listed": len(by_name),
+        "total_canonical_names": len(canonical_names),
+        "total_orphan_names": len(orphan_names),
+        "total_orphan_bytes": sum(v["size_bytes"] for v in orphan_names.values()),
+        "pattern_counts": dict(pattern_counts),
+        "pattern_bytes": dict(pattern_bytes),
+        "pattern_samples": {p: sorted(names)[:25] for p, names in pattern_samples.items()},
+    }
+    with open(out_path, "w") as f:
+        json.dump(result, f, indent=2, sort_keys=True)
+    print(f"[classify-orphans] {arch}: {len(orphan_names)} orphan name(s) across "
+          f"{len(by_name)} listed objects -- patterns: {dict(pattern_counts)}",
+          file=sys.stderr, flush=True)
+    return result
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", required=True, choices=["aarch64", "x86_64"])
@@ -941,12 +1227,34 @@ def main():
     ap.add_argument("--diagnose-ambiguous", type=int, metavar="N", default=0,
                      help="Instead of a full run, sample N ambiguous packages "
                           "and explain exactly why each is ambiguous, then exit.")
+    ap.add_argument("--evaluate-bootstrap", type=int, metavar="N", default=0,
+                     help="Instead of a full run, evaluate the semantic-"
+                          "fingerprint bootstrap mechanism against N sampled "
+                          "ambiguous packages (accepted/zero_match/multi_match/"
+                          "contamination_blocked with full detail), then exit. "
+                          "Never publishes anything.")
+    ap.add_argument("--classify-orphans", action="store_true",
+                     help="Instead of a full run, list pkgs/<arch>/ and classify "
+                          "orphan objects by which siblings exist, then exit. "
+                          "Read-only -- never quarantines or deletes anything.")
     args = ap.parse_args()
 
     if args.diagnose_ambiguous:
         os.makedirs(args.report_dir, exist_ok=True)
         out_path = os.path.join(args.report_dir, f"ambiguous-diagnosis-{args.arch}.json")
         diagnose_ambiguous(args.arch, args.diagnose_ambiguous, out_path)
+        return
+
+    if args.evaluate_bootstrap:
+        os.makedirs(args.report_dir, exist_ok=True)
+        out_path = os.path.join(args.report_dir, f"bootstrap-evaluation-{args.arch}.json")
+        evaluate_bootstrap_semantic(args.arch, args.evaluate_bootstrap, out_path)
+        return
+
+    if args.classify_orphans:
+        os.makedirs(args.report_dir, exist_ok=True)
+        out_path = os.path.join(args.report_dir, f"orphan-classification-{args.arch}.json")
+        classify_orphans(args.arch, out_path)
         return
 
     workdir = tempfile.mkdtemp()
