@@ -23,7 +23,10 @@ import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mirror_common import sanitize_name, is_blocked, in_shard, b2_cp, b2_get, sh
+from mirror_common import (
+    sanitize_name, is_blocked, in_shard, b2_cp, b2_get, sh,
+    _index_line_is_blocked,
+)
 
 import mirror_ubuntu
 import mirror_debian
@@ -141,7 +144,7 @@ def publish_healed(arch, wsh_names):
             lines.update(l.strip() for l in f if l.strip())
         os.remove(tmp)
     lines.update(wsh_names)
-    lines = {l for l in lines if not is_blocked(l)}
+    lines = {l for l in lines if not _index_line_is_blocked(l)}
     out = tempfile.mktemp()
     with open(out, "w") as f:
         f.writelines(f"{l}\n" for l in sorted(lines))

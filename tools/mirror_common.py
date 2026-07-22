@@ -16,13 +16,65 @@ import tempfile
 B2_ENDPOINT = "https://s3.eu-central-003.backblazeb2.com"
 B2_BUCKET = "wishpkgs"
 
-# Every upstream/tool name that would give away where a package really came
-# from. Shared across all mirrors so the catalog is uniformly anonymous no
-# matter which script produced a given entry.
-BLOCKED_NAME_SUBSTRINGS = (
-    "debian", "ubuntu", "apt", "dpkg",
-    "fedora", "redhat", "rhel", "centos", "rpm", "dnf", "yum",
-)
+# Exact package names known to be pure Debian/Ubuntu/Fedora packaging
+# tooling or distro-branding metapackages: things with no function outside
+# their origin distro's package-management stack (need a live apt/dpkg/dnf
+# database, sources.list, live repo config -- none of which this project
+# ships) or that are nothing but a curated-set marker with no real payload.
+# EXACT match only -- this used to be a substring check against
+# ("debian","ubuntu","apt","dpkg","fedora",...), which also caught real,
+# needed runtime/data packages any number of OTHER packages legitimately
+# Depend on directly: "ubuntu-mono" (a GTK icon theme), "fonts-ubuntu"/
+# "fonts-ubuntu-console", "gsettings-ubuntu-schemas", "ubuntu-wallpapers"
+# (-noble), "debianutils" (8 real Depends references in one Ubuntu Packages
+# snapshot alone), "python3-debian", "libdebian-installer4"(-dev). Blocking
+# those left their dependency permanently unresolvable for every package
+# that named them, silently breaking real install chains (found via a
+# real-world report, not proactively). Extend this set one exact name at a
+# time -- never reintroduce a broad substring rule.
+BLOCKED_EXACT_NAMES = {
+    # apt/dpkg tooling -- needs a live package database this project
+    # doesn't have.
+    "apt", "apt-utils", "apt-transport-https", "apt-listchanges",
+    "apt-listbugs", "dpkg", "dpkg-dev", "dpkg-repack",
+    # Ubuntu subscription/update/branding tooling and metapackages.
+    "ubuntu-advantage-tools", "ubuntu-advantage-desktop-daemon",
+    "ubuntu-pro-client", "ubuntu-pro-client-l10n",
+    "ubuntu-release-upgrader-core", "ubuntu-release-upgrader-gtk",
+    "ubuntu-release-upgrader-qt", "update-manager", "update-manager-core",
+    "update-notifier", "software-properties-common",
+    "software-properties-gtk", "software-properties-qt",
+    "ubuntu-drivers-common", "ubuntu-report", "ubuntu-keyring",
+    "ubuntu-cloud-keyring", "ubuntu-dbgsym-keyring", "ubuntu-oem-keyring",
+    "debian-archive-keyring", "debian-keyring", "debian-goodies",
+    "popularity-contest", "ubiquity-ubuntu-artwork", "ubuntu-docs",
+    "ubuntu-server", "ubuntu-server-minimal", "ubuntu-desktop",
+    "ubuntu-desktop-minimal", "ubuntu-minimal", "ubuntu-standard",
+    "ubuntu-session", "ubuntu-settings", "ubuntu-raspi-settings",
+    "ubuntu-raspi-settings-desktop", "ubuntu-raspi-settings-server",
+    "ubuntu-wsl", "ubuntu-cloud-minimal", "ubuntu-kernel-accessories",
+    "gnome-shell-extension-ubuntu-dock",
+    "gnome-shell-extension-ubuntu-tiling-assistant",
+    "network-manager-config-connectivity-ubuntu", "intltool-debian",
+    # Fedora/RHEL-family packaging tooling and release/branding markers.
+    "dnf", "dnf-plugins-core", "yum", "yum-utils",
+    "fedora-release", "fedora-repos", "fedora-gpg-keys",
+    "centos-release", "centos-stream-release", "rhel-release",
+    "redhat-release",
+}
+
+# Real runtime/data packages that must NEVER be blocked even though their
+# name contains a distro-name substring -- kept explicit (not just "absent
+# from BLOCKED_EXACT_NAMES") so a future addition to that set can't
+# accidentally re-catch one of these by name collision. See the comment on
+# BLOCKED_EXACT_NAMES for why each of these matters.
+ALWAYS_ALLOWED_NAMES = {
+    "ubuntu-mono", "fonts-ubuntu", "fonts-ubuntu-console",
+    "gsettings-ubuntu-schemas", "ubuntu-wallpapers", "ubuntu-wallpapers-noble",
+    "debianutils", "python3-debian", "libdebian-installer4",
+    "libdebian-installer4-dev", "libdebian-installer-extra4",
+    "libdebian-dpkgcross-perl",
+}
 
 _REDACT_RE = re.compile(
     r"\b(ubuntu|debian|fedora|red ?hat|rhel|centos)\b", re.IGNORECASE
@@ -54,8 +106,17 @@ def redact(text):
 
 
 def is_blocked(name_raw):
+    """Exact-name check against BLOCKED_EXACT_NAMES, with ALWAYS_ALLOWED_NAMES
+    as an override. `name_raw` must be a bare package name (upstream or
+    already-sanitized) -- NOT a full ".wsh" index-line filename; callers
+    filtering full index lines must extract the name first (see
+    parse_name_from_index_line), since an exact-match check against a
+    "name-version-release-arch.wsh" string can never match a bare blocked
+    name."""
     lower = name_raw.lower()
-    return any(s in lower for s in BLOCKED_NAME_SUBSTRINGS)
+    if lower in ALWAYS_ALLOWED_NAMES:
+        return False
+    return lower in BLOCKED_EXACT_NAMES
 
 
 def in_shard(name, shard, num_shards):
@@ -243,6 +304,15 @@ def parse_name_from_index_line(line):
     return m.group("name") if m else None
 
 
+def _index_line_is_blocked(line):
+    """is_blocked() takes a bare package name, not a full
+    "name-version-release-arch.wsh" index line -- extract the name first.
+    A line that doesn't even parse as a valid index entry is left alone
+    here (not this function's job to drop malformed lines)."""
+    name = parse_name_from_index_line(line)
+    return is_blocked(name) if name else False
+
+
 def load_canonical_names(arch, state_dir):
     """Every package name already published for this arch, regardless of
     which distro mirror put it there. Callers must skip anything in this set
@@ -286,7 +356,7 @@ def merge_index(arch, distro, own_index_path, state_dir, num_shards, shard):
                 with open(tmp) as f:
                     lines.update(l.strip() for l in f if l.strip())
 
-    lines = {l for l in lines if not is_blocked(l)}
+    lines = {l for l in lines if not _index_line_is_blocked(l)}
 
     merged_path = os.path.join(state_dir, f"{arch}.merged.index")
     with open(merged_path, "w") as f:

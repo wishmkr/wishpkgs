@@ -173,25 +173,57 @@ def backfill_fedora(arch_wish, canonical, workdir):
     return rewritten, provides_pairs
 
 
-def publish_provides(arch, provides_pairs):
-    """Read-union-write, same pattern as heal_missing.py's publish_provides
-    -- appends this shard's freshly-regenerated Provides pairs to the
-    shared index/<arch>-provides.txt without dropping anything already
-    published by other shards/distros."""
-    if not provides_pairs:
-        return
+def shard_provides_key(arch, shard):
+    return f"state/backfill/{arch}/shard{shard}-provides.txt"
+
+
+def publish_provides_shard(arch, shard, provides_pairs):
+    """Writes ONLY this shard's own regenerated Provides pairs to a
+    per-shard file -- never read-modify-writes the shared canonical
+    index/<arch>-provides.txt directly. With up to 16 shards (2 arches x 8
+    shards) finishing around the same time, a naive read-union-write race
+    on ONE shared file silently loses entries: two shards that both read
+    the same base snapshot and then write back independently leave only
+    the LAST writer's additions in place, dropping whatever every other
+    concurrent shard contributed. merge_provides_shards() below is the
+    only thing that ever writes the canonical file, exactly once, after
+    every shard has finished -- a single-writer merge instead of N racing
+    read-modify-writers."""
     tmp = tempfile.mktemp()
+    with open(tmp, "w") as f:
+        f.writelines(f"{v} {r}\n" for v, r in sorted(set(provides_pairs)))
+    b2_cp(tmp, shard_provides_key(arch, shard))
+    os.remove(tmp)
+
+
+def merge_provides_shards(arch, num_shards):
+    """Single-writer merge: unions every shard's partial provides file for
+    `arch` (plus whatever's already canonical) and uploads the result
+    exactly once. Must only run after every backfill shard for `arch` has
+    completed -- there is deliberately no retry/re-merge safety net here
+    beyond running this step again, since it always re-derives the full
+    union from scratch (never destructive)."""
     lines = set()
+    tmp = tempfile.mktemp()
     if b2_get(f"index/{arch}-provides.txt", tmp):
         with open(tmp) as f:
             lines.update(l.strip() for l in f if l.strip())
         os.remove(tmp)
-    lines.update(f"{v} {r}" for v, r in provides_pairs)
+    found_shards = 0
+    for s in range(num_shards):
+        shard_tmp = tempfile.mktemp()
+        if b2_get(shard_provides_key(arch, s), shard_tmp):
+            found_shards += 1
+            with open(shard_tmp) as f:
+                lines.update(l.strip() for l in f if l.strip())
+            os.remove(shard_tmp)
     out = tempfile.mktemp()
     with open(out, "w") as f:
         f.writelines(f"{l}\n" for l in sorted(lines))
     b2_cp(out, f"index/{arch}-provides.txt")
     os.remove(out)
+    print(f"{arch}: merged {len(lines)} provides pairs from "
+          f"{found_shards}/{num_shards} shard files", file=sys.stderr)
 
 
 def main():
@@ -222,9 +254,11 @@ def main():
         total_rewritten += n
         all_provides.extend(p)
 
-    publish_provides(ARCH, all_provides)
+    publish_provides_shard(ARCH, SHARD, all_provides)
     print(f"total: rewrote {total_rewritten} .info files, "
-          f"{len(all_provides)} provides pairs published", file=sys.stderr)
+          f"{len(all_provides)} provides pairs written to this shard's "
+          f"partial file (not yet merged into the canonical index)",
+          file=sys.stderr)
 
     out = os.environ.get("GITHUB_OUTPUT")
     if out:
@@ -232,5 +266,18 @@ def main():
             f.write(f"rewritten={total_rewritten}\n")
 
 
+def main_merge():
+    """CLI entry for the single merge job that runs after every backfill
+    shard finishes: `python3 backfill_metadata.py merge-provides aarch64
+    x86_64`. Never run this concurrently with itself or while any shard for
+    the same arch is still writing its partial file."""
+    arches = sys.argv[2:] or ["aarch64", "x86_64"]
+    for arch in arches:
+        merge_provides_shards(arch, NUM_SHARDS)
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "merge-provides":
+        main_merge()
+    else:
+        main()

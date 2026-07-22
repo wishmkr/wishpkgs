@@ -53,3 +53,14 @@ jobs:
       - name: Backfill metadata
         working-directory: tools
         run: python3 backfill_metadata.py
+
+  merge-provides:
+    needs: backfill
+    if: always() && needs.backfill.result != 'cancelled'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Merge per-shard provides files into the canonical index
+        working-directory: tools
+        run: python3 backfill_metadata.py merge-provides aarch64 x86_64

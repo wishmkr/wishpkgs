@@ -9,11 +9,15 @@ Regression tests for the mirror-pipeline bugs found 2026-07-22:
   2. "Architecture: all" packages were suspected of being excluded from
      both catalogs -- turned out NOT to be a real bug (Debian/Ubuntu's
      archive already inlines arch:all packages into every binary-<arch>
-     Packages.gz), but ubuntu-mono specifically IS absent, deliberately,
-     via the is_blocked() name filter (it contains "ubuntu"). Both halves
-     of that are asserted here so neither regresses silently: arch:all
-     packages must still parse/flow through normally, and the blocklist
-     must keep catching distro-named packages.
+     Packages.gz). What WAS a real bug: is_blocked()'s substring filter
+     ("ubuntu" in lower(name)) caught ubuntu-mono, breaking every package
+     that Depends on it directly for its GTK icon theme -- a real runtime
+     dependency, not distro branding. Fixed by switching to an exact-name
+     blocklist plus an explicit allowlist. Also caught in the same pass: a
+     couple of call sites were checking is_blocked() against a FULL
+     ".wsh" index-line filename instead of the bare package name, which an
+     exact-match check can never match -- silently disabling merge_index()'s
+     purge-persistence filtering. Fixed via _index_line_is_blocked().
   3. tools/test_packages.py's check_package() reported ANY dependency with
      no literal .info as "missing_info", even when it was a virtual/ABI
      name (e.g. "qtbase-abi-5-15-8") satisfied by another package's
@@ -21,10 +25,20 @@ Regression tests for the mirror-pipeline bugs found 2026-07-22:
      stuck to it ("foo (>=1.2)|bar" looked up as one literal name). Fixed
      by parsing the full wire format and consulting the provides index
      before giving up.
+  4. tools/backfill_metadata.py originally had every shard (up to 16
+     running concurrently) read-modify-write the SAME canonical
+     index/<arch>-provides.txt directly -- a classic race where the last
+     shard to finish overwrites everyone else's additions with whatever it
+     read at ITS start, silently losing entries from shards that finished
+     first. Fixed before ever running against production: each shard now
+     writes only its own partial file
+     (state/backfill/<arch>/shard<N>-provides.txt); a single separate
+     merge job unions all of them plus the existing canonical file and
+     uploads once, so there is exactly one writer of the canonical key.
 
 No network access, no B2 credentials -- everything here runs against
-synthetic Packages-file text and a stubbed http_get, so it's safe and fast
-to run in CI on every push.
+synthetic Packages-file text and a stubbed http_get/b2_get/b2_cp, so it's
+safe and fast to run in CI on every push.
 """
 import os
 import sys
@@ -75,9 +89,13 @@ class MultiarchQualifierTests(unittest.TestCase):
 class ArchitectureAllTests(unittest.TestCase):
     """Item 2: arch:all packages must still parse and flow through the
     normal todo-building path (they're inlined in binary-<arch>, no special
-    fetch needed) -- and the name-blocklist must still catch
-    distro-named ones like ubuntu-mono on purpose, not by accident of a
-    missing-arch-all fetch that would have looked like the same symptom."""
+    fetch needed). ubuntu-mono was initially thought to be a missing-arch:all
+    bug; turned out to be is_blocked()'s substring filter catching a real,
+    needed runtime dependency (several desktop packages Depend on it
+    directly for their icon theme) -- fixed by switching is_blocked() from a
+    substring check to an exact-name blocklist with an explicit allowlist,
+    so ubuntu-mono must now resolve like any other package. A real
+    packaging-tool name (e.g. "apt") must still be blocked."""
 
     SAMPLE_PACKAGES_TEXT = (
         "Package: ubuntu-mono\n"
@@ -102,11 +120,36 @@ class ArchitectureAllTests(unittest.TestCase):
             next(s for s in stanzas if s["Package"] == "adwaita-icon-theme")["Architecture"],
             "all")
 
-    def test_ubuntu_mono_is_blocked_on_purpose(self):
-        self.assertTrue(mirror_common.is_blocked("ubuntu-mono"))
+    def test_ubuntu_mono_is_not_blocked(self):
+        # Regression: was blocked by the old substring filter, breaking
+        # every package that Depends on it directly (a real GTK icon theme,
+        # not distro branding with no function).
+        self.assertFalse(mirror_common.is_blocked("ubuntu-mono"))
+
+    def test_ubuntu_mono_in_always_allowed_names(self):
+        self.assertIn("ubuntu-mono", mirror_common.ALWAYS_ALLOWED_NAMES)
 
     def test_non_distro_named_arch_all_package_not_blocked(self):
         self.assertFalse(mirror_common.is_blocked("adwaita-icon-theme"))
+
+    def test_real_packaging_tool_still_blocked(self):
+        # apt/dpkg genuinely are meaningless without a live package
+        # database this project doesn't ship -- the exact-name blocklist
+        # must still catch these on purpose.
+        self.assertTrue(mirror_common.is_blocked("apt"))
+        self.assertTrue(mirror_common.is_blocked("dpkg"))
+
+    def test_index_line_blocklist_check_uses_bare_name(self):
+        # is_blocked() is EXACT-match now -- calling it directly on a full
+        # ".wsh" index-line filename would never match anything, silently
+        # disabling merge_index()'s purge-persistence filtering. Callers
+        # that filter full index lines must go through
+        # _index_line_is_blocked(), which extracts the bare name first.
+        self.assertFalse(mirror_common.is_blocked("apt-2.7.3-1-x86_64.wsh"))
+        self.assertTrue(
+            mirror_common._index_line_is_blocked("apt-2.7.3-1-x86_64.wsh"))
+        self.assertFalse(
+            mirror_common._index_line_is_blocked("ubuntu-mono-24.04-1-x86_64.wsh"))
 
 
 class ProvidesAwareTestPipelineTests(unittest.TestCase):
@@ -181,6 +224,69 @@ class ProvidesAwareTestPipelineTests(unittest.TestCase):
         tp._INFO_CACHE["some-pkg"] = None  # unused directly; groups checked below
         groups = tp._parse_depends_field("perl")
         self.assertEqual(tp.check_dep_group("aarch64", groups[0], ()), "ok")
+
+
+class ProvidesShardMergeTests(unittest.TestCase):
+    """Item 4: per-shard partial provides files must merge without losing
+    any shard's contribution -- the exact failure mode of the old
+    read-modify-write-the-shared-file race, simulated here by writing
+    several shards' files to a fake in-memory B2 and confirming the merge
+    step's output contains every one of them."""
+
+    def setUp(self):
+        import backfill_metadata as bm
+        self.bm = bm
+        self._fake_b2 = {}  # remote_key -> file content (str)
+
+        def fake_b2_cp(local, remote_key):
+            with open(local) as f:
+                self._fake_b2[remote_key] = f.read()
+
+        def fake_b2_get(remote_key, local):
+            if remote_key not in self._fake_b2:
+                return False
+            with open(local, "w") as f:
+                f.write(self._fake_b2[remote_key])
+            return True
+
+        self._orig_b2_cp, self._orig_b2_get = bm.b2_cp, bm.b2_get
+        bm.b2_cp, bm.b2_get = fake_b2_cp, fake_b2_get
+
+    def tearDown(self):
+        self.bm.b2_cp, self.bm.b2_get = self._orig_b2_cp, self._orig_b2_get
+
+    def test_shards_never_touch_canonical_file_directly(self):
+        self.bm.publish_provides_shard("aarch64", 0, [("virt-a", "real-a")])
+        self.bm.publish_provides_shard("aarch64", 1, [("virt-b", "real-b")])
+        self.assertNotIn("index/aarch64-provides.txt", self._fake_b2)
+        self.assertIn(self.bm.shard_provides_key("aarch64", 0), self._fake_b2)
+        self.assertIn(self.bm.shard_provides_key("aarch64", 1), self._fake_b2)
+
+    def test_merge_unions_every_shard_without_dropping_any(self):
+        # Simulates 4 shards finishing concurrently, each with its own
+        # distinct contribution -- the exact scenario a shared
+        # read-modify-write would lose entries under.
+        for shard, pair in enumerate(
+                [("virt-a", "real-a"), ("virt-b", "real-b"),
+                 ("virt-c", "real-c"), ("virt-d", "real-d")]):
+            self.bm.publish_provides_shard("aarch64", shard, [pair])
+
+        self.bm.merge_provides_shards("aarch64", 4)
+
+        merged = self._fake_b2["index/aarch64-provides.txt"]
+        for virt, real in [("virt-a", "real-a"), ("virt-b", "real-b"),
+                            ("virt-c", "real-c"), ("virt-d", "real-d")]:
+            self.assertIn(f"{virt} {real}", merged)
+
+    def test_merge_preserves_preexisting_canonical_entries(self):
+        self._fake_b2["index/aarch64-provides.txt"] = "old-virt old-real\n"
+        self.bm.publish_provides_shard("aarch64", 0, [("new-virt", "new-real")])
+
+        self.bm.merge_provides_shards("aarch64", 1)
+
+        merged = self._fake_b2["index/aarch64-provides.txt"]
+        self.assertIn("old-virt old-real", merged)
+        self.assertIn("new-virt new-real", merged)
 
 
 if __name__ == "__main__":

@@ -34,9 +34,7 @@ verbatim, and that requirement is honored here regardless of naming.
 import gzip
 import hashlib
 import os
-import re
 import shutil
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -47,6 +45,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mirror_common import (
     parse_dep_field, format_dep_field, provides_names,
     merge_provides, provides_shard_key,
+    sh, b2_cp, b2_get, is_blocked, in_shard, redact, sanitize_name,
+    sanitize_version, load_state_set, merge_index as _common_merge_index,
 )
 
 DEADLINE = time.monotonic() + float(os.environ.get("MIRROR_DEADLINE_SECONDS", "19500"))
@@ -64,75 +64,6 @@ ARCHES = {
 
 B2_ENDPOINT = "https://s3.eu-central-003.backblazeb2.com"
 B2_BUCKET = "wishpkgs"
-
-_REDACT_RE = re.compile(r"\b(ubuntu|debian)\b", re.IGNORECASE)
-
-
-def redact(text):
-    """Drop literal distro-name mentions from text WE generate. Never applied
-    to the package's own shipped files (copyright/license/docs stay verbatim)."""
-    return _REDACT_RE.sub("the system", text) if text else text
-
-
-BLOCKED_NAME_SUBSTRINGS = ("debian", "ubuntu", "apt", "dpkg")
-
-
-def is_blocked(name_raw):
-    """Packages whose upstream name itself names the distro or its own
-    packaging tools (apt, dpkg, ubuntu-*, debian-*) are excluded outright --
-    they're either meaningless without the Debian packaging stack we don't
-    ship (apt/dpkg need a live package database, sources.list, etc.) or they
-    just name-drop the distro directly."""
-    lower = name_raw.lower()
-    return any(s in lower for s in BLOCKED_NAME_SUBSTRINGS)
-
-
-def in_shard(name):
-    """Stable partition: hashlib (not the built-in hash()) so the same
-    package always maps to the same shard across separate processes/runs --
-    Python's str hash() is randomized per-process by default."""
-    if NUM_SHARDS <= 1:
-        return True
-    digest = hashlib.md5(name.encode()).hexdigest()
-    return int(digest, 16) % NUM_SHARDS == SHARD
-
-
-def sh(cmd):
-    subprocess.run(cmd, shell=True, check=True)
-
-
-def b2_cp(local, remote_key):
-    sh(f'aws s3 cp "{local}" "s3://{B2_BUCKET}/{remote_key}" '
-       f'--endpoint-url {B2_ENDPOINT} --no-progress')
-
-
-def b2_get(remote_key, local):
-    r = subprocess.run(
-        f'aws s3 cp "s3://{B2_BUCKET}/{remote_key}" "{local}" '
-        f'--endpoint-url {B2_ENDPOINT} --no-progress',
-        shell=True, capture_output=True)
-    return r.returncode == 0
-
-
-# ---- sanitization: map arbitrary upstream package metadata onto wish's
-# strict filename/name regexes (PathValidator::is_safe_package_name allows
-# only [a-z0-9][a-z0-9-]*; RemoteIndex's index-line regex requires the
-# version group to be [0-9.]+ and release to be \d+) ----
-
-def sanitize_name(raw):
-    n = raw.lower().replace("+", "plus").replace(".", "-")
-    n = re.sub(r"[^a-z0-9-]", "-", n)
-    n = re.sub(r"-{2,}", "-", n).strip("-")
-    if not n or not n[0].isalnum():
-        n = "pkg-" + n
-    return n
-
-
-def sanitize_version(raw):
-    core = raw.split(":", 1)[-1]  # drop epoch
-    m = re.match(r"[0-9]+(?:\.[0-9]+)*", core)
-    version = m.group(0) if m else "0"
-    return version or "0"
 
 
 def sanitize_depends(field):
@@ -168,18 +99,6 @@ def fetch_packages_index(base, dist, component, deb_arch):
     print(f"fetching {url}", file=sys.stderr)
     with urlopen(url, timeout=60) as r:
         return gzip.decompress(r.read()).decode("utf-8", "replace")
-
-
-def load_state_set(key):
-    tmp = tempfile.mktemp()
-    try:
-        if b2_get(key, tmp):
-            with open(tmp) as f:
-                return {l.strip() for l in f if l.strip()}
-    finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-    return set()
 
 
 def process_package(arch_wish, base, pkg, workdir):
@@ -254,46 +173,15 @@ def process_package(arch_wish, base, pkg, workdir):
 
 
 def merge_index(arch, own_index_path, state_dir):
-    """Union this shard's fresh index with a snapshot of every other shard's
-    (fetched from B2) AND whatever the canonical index/<arch>.txt already
-    lists, then publish the result. Including the current canonical file
-    matters during the transition to a new NUM_SHARDS value (or right after
-    switching from unsharded state): without it, the merge would only ever
-    reflect what these specific shards have (re)confirmed so far, silently
-    hiding previously-published packages until every shard catches back up.
-    Two shards merging around the same moment can race and drop each other's
-    latest line -- harmless here, since the next periodic merge (by
-    whichever shard writes next) re-derives the union from scratch, and now
-    always includes the current canonical file too, so it self-heals and
-    never *shrinks*."""
-    lines = set()
-    if os.path.exists(own_index_path):
-        with open(own_index_path) as f:
-            lines.update(l.strip() for l in f if l.strip())
-    current = os.path.join(state_dir, f"current-{arch}.index")
-    if b2_get(f"index/{arch}.txt", current):
-        with open(current) as f:
-            lines.update(l.strip() for l in f if l.strip())
-    for s in range(NUM_SHARDS):
-        if s == SHARD:
-            continue
-        tmp = os.path.join(state_dir, f"other-{arch}-shard{s}.index")
-        if b2_get(f"index/{arch}/shard{s}.txt", tmp):
-            with open(tmp) as f:
-                lines.update(l.strip() for l in f if l.strip())
-    # Defensive: a shard that started before a purge ran is still carrying
-    # the purged names in its own local index file (nothing ever removes
-    # them from there mid-run), and the union above would otherwise merge
-    # them straight back into the canonical file on every flush, silently
-    # undoing the purge for as long as that shard keeps running. Filtering
-    # here -- not just at todo-build time -- makes a block permanent
-    # regardless of what any already-running process still has cached.
-    lines = {l for l in lines if not is_blocked(l)}
-
-    merged_path = os.path.join(state_dir, f"{arch}.merged.index")
-    with open(merged_path, "w") as f:
-        f.writelines(f"{l}\n" for l in sorted(lines))
-    b2_cp(merged_path, f"index/{arch}.txt")
+    """Thin wrapper so existing call sites in this file don't need to
+    change -- delegates to mirror_common.merge_index (the SAME function
+    mirror_debian.py/mirror_fedora.py already use), which already
+    special-cases Ubuntu's legacy shard-key naming (index/<arch>/shard<N>.txt,
+    no distro prefix) via shard_index_key(). Used to be its own duplicate
+    implementation here; that duplication is exactly how the blocklist fix
+    almost shipped without covering this path -- this file's is_blocked()
+    was a stale local copy the shared fix never reached."""
+    _common_merge_index(arch, "ubuntu", own_index_path, state_dir, NUM_SHARDS, SHARD)
 
 
 def mirror_arch(arch_wish, state_dir):
@@ -327,7 +215,7 @@ def mirror_arch(arch_wish, state_dir):
                 continue
             if is_blocked(name_raw):
                 continue
-            if not in_shard(name_raw):
+            if not in_shard(name_raw, SHARD, NUM_SHARDS):
                 continue
             uid = f"{name_raw}={ver_raw}"
             if uid in done or uid in failed:
