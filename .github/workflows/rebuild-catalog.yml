@@ -48,6 +48,10 @@ on:
         description: "Classify orphan objects by type instead of a full run (read-only, no quarantine/delete)"
         type: boolean
         default: false
+      classify_unresolved_deps:
+        description: "Root-cause every unresolved dependency group into missing_literal/missing_provider/normalization_mismatch/intentionally_excluded/genuinely_absent instead of a full run (read-only)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -91,6 +95,8 @@ jobs:
             ARGS="$ARGS --evaluate-bootstrap ${{ inputs.evaluate_bootstrap }}"
           elif [ "${{ inputs.classify_orphans }}" = "true" ]; then
             ARGS="$ARGS --classify-orphans"
+          elif [ "${{ inputs.classify_unresolved_deps }}" = "true" ]; then
+            ARGS="$ARGS --classify-unresolved-deps"
           elif [ "${{ inputs.publish_arch }}" = "${{ matrix.arch }}" ]; then
             ARGS="$ARGS --publish"
           fi
@@ -107,4 +113,5 @@ jobs:
             repair-reports/ambiguous-diagnosis-${{ matrix.arch }}.json
             repair-reports/bootstrap-evaluation-${{ matrix.arch }}.json
             repair-reports/orphan-classification-${{ matrix.arch }}.json
+            repair-reports/unresolved-deps-classification-${{ matrix.arch }}.json
           if-no-files-found: warn

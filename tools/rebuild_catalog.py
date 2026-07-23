@@ -65,6 +65,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -81,7 +82,7 @@ from mirror_common import (
 from provenance import (
     UpstreamStanza, match_provenance, ProvenanceResult, ProvenanceRecord,
     verify_continuity, try_bootstrap_match, fingerprints_semantically_equal,
-    BootstrapMatchResult,
+    BootstrapMatchResult, candidates_are_output_equivalent,
 )
 
 import mirror_ubuntu
@@ -511,13 +512,22 @@ class CatalogRebuild:
         self.keep_orphans = keep_orphans
         self.report = {
             "arch": arch,
-            "repaired": {}, "unchanged": {}, "ambiguous": {},
+            # "ambiguous_output_conflict": a genuine name+version collision
+            # where surviving candidates produce DIFFERENT output --
+            # blocks publish. "equivalent_provenance_tie": the same kind
+            # of collision, but every surviving candidate produces
+            # byte-identical fingerprint+.info -- publish-safe, since the
+            # choice is provably irrelevant (see
+            # candidates_are_output_equivalent).
+            "repaired": {}, "unchanged": {}, "ambiguous_output_conflict": {},
+            "equivalent_provenance_tie": {},
             "orphaned": {}, "unresolved": {},
             # "rejected": a unique bootstrap fingerprint match that hit a
             # concrete contradiction (exclusion list, self-inconsistent
-            # filename) -- distinct from "ambiguous" (genuine multi-match
-            # ties) and from "invalid_provides" (a different rejection:
-            # a provides target that isn't a canonical package at all).
+            # filename) -- distinct from "ambiguous_output_conflict"
+            # (genuine multi-match ties with differing output) and from
+            # "invalid_provides" (a different rejection: a provides target
+            # that isn't a canonical package at all).
             "rejected": {},
             "invalid_provides": {},
             "continuity_mismatches": {},
@@ -530,6 +540,8 @@ class CatalogRebuild:
         self.canonical_versions = {}
         self.info_map = {}        # name -> current .info text, bulk-fetched once (see bulk_fetch_info_and_sha256)
         self.sha256_map = {}      # wsh_filename -> live sha256, bulk-fetched once
+        self.stanzas = []          # every scanned upstream stanza (any distro, canonical or not) -- kept for classify_unresolved_dependencies
+        self.unresolved_deps_full = []  # (name, group) for every unresolved dependency group -- see _validate_dependencies
 
     def _bump(self, bucket, distro):
         self.report[bucket][distro] = self.report[bucket].get(distro, 0) + 1
@@ -543,6 +555,7 @@ class CatalogRebuild:
               file=sys.stderr, flush=True)
 
         stanzas = scan_all_stanzas(self.arch)
+        self.stanzas = stanzas
 
         print(f"[run] bulk-fetching current .info/.sha256 objects for {self.arch}...",
               file=sys.stderr, flush=True)
@@ -587,16 +600,60 @@ class CatalogRebuild:
                       f"repaired={sum(self.report['repaired'].values())} "
                       f"unchanged={sum(self.report['unchanged'].values())} "
                       f"unresolved={sum(self.report['unresolved'].values())} "
-                      f"ambiguous={sum(self.report['ambiguous'].values())}",
+                      f"ambiguous={sum(self.report['ambiguous_output_conflict'].values())}",
                       file=sys.stderr, flush=True)
             if result.status == ProvenanceResult.UNRESOLVED:
                 self._bump("unresolved", "unknown")
                 continue
             if result.status == ProvenanceResult.AMBIGUOUS:
                 # Genuinely ambiguous by name+version+arch alone -- before
-                # giving up, try bootstrap disambiguation via a semantic
-                # identity+relationship fingerprint against the already-
-                # live .info (see tools/provenance.try_bootstrap_match).
+                # even reaching for live-info evidence, check whether it
+                # actually matters: if EVERY surviving candidate renders
+                # byte-identical semantic fingerprint AND .info text (see
+                # candidates_are_output_equivalent), then no source needs
+                # to be proven -- the published output is provably the
+                # same no matter which candidate "wins". This is a
+                # distinct claim from bootstrap matching below: it makes
+                # no assertion about which upstream produced the payload,
+                # only that the choice is irrelevant to what gets
+                # published. Recorded as CONFIDENCE_EQUIVALENT_TIE with
+                # the full tied candidate set kept in the manifest, never
+                # collapsed into a single unproven source.
+                if candidates_are_output_equivalent(
+                        result.candidates, semantic_fingerprint_from_stanza,
+                        render_info_from_stanza):
+                    chosen = sorted(
+                        result.candidates,
+                        key=lambda c: (c.source_distro, c.suite, c.component,
+                                        c.upstream_version,
+                                        c.upstream_filename or ""))[0]
+                    live_sha256 = self._fetch_live_payload_sha256(name)
+                    prior_record = self.prior_manifest.get(name)
+                    if not verify_continuity(chosen, prior_record, live_sha256):
+                        self._bump("unresolved", "equivalent-tie-continuity-mismatch")
+                        self._bump("continuity_mismatches", "equivalent-tie")
+                        continue
+                    wsh_filename = self._current_wsh_filename(name, canonical_versions[name])
+                    record = stanza_to_record(
+                        name, self.arch, chosen, wsh_filename, live_sha256,
+                        confidence=ProvenanceRecord.CONFIDENCE_EQUIVALENT_TIE)
+                    record.equivalent_candidates = [
+                        {"source_distro": c.source_distro, "suite": c.suite,
+                         "source_arch": c.source_arch, "component": c.component,
+                         "upstream_name": c.upstream_name,
+                         "upstream_version": c.upstream_version}
+                        for c in result.candidates
+                    ]
+                    self.new_manifest[name] = record
+                    self.staged_info[name] = render_info_from_stanza(chosen)
+                    self._bump("equivalent_provenance_tie",
+                               ",".join(sorted({c.source_distro for c in result.candidates})))
+                    continue
+
+                # Still genuinely ambiguous -- try bootstrap disambiguation
+                # via a semantic identity+relationship fingerprint against
+                # the already-live .info (see
+                # tools/provenance.try_bootstrap_match).
                 # This is NOT a guess: it only accepts when exactly one
                 # candidate's normalized depends/pre-depends/provides/
                 # conflicts/breaks/replaces/essential/multi-arch fields
@@ -625,12 +682,13 @@ class CatalogRebuild:
                     continue
                 if bootstrap_result.status == BootstrapMatchResult.AMBIGUOUS:
                     distros = ",".join(sorted({c.source_distro for c in result.candidates}))
-                    self._bump("ambiguous", distros)
+                    self._bump("ambiguous_output_conflict", distros)
                     continue
                 if bootstrap_result.status == BootstrapMatchResult.REJECTED:
                     # A concrete contradiction, not a mere tie -- tracked
-                    # separately from "ambiguous" so the repair report (and
-                    # the publish gate below) can name the actual reason.
+                    # separately from "ambiguous_output_conflict" so the
+                    # repair report (and the publish gate below) can name
+                    # the actual reason.
                     rejected_distro = (bootstrap_result.stanza.source_distro
                                         if bootstrap_result.stanza else "unknown")
                     self._bump("rejected", rejected_distro)
@@ -692,7 +750,7 @@ class CatalogRebuild:
               f"{elapsed:.0f}s) -- repaired={sum(self.report['repaired'].values())} "
               f"unchanged={sum(self.report['unchanged'].values())} "
               f"unresolved={sum(self.report['unresolved'].values())} "
-              f"ambiguous={sum(self.report['ambiguous'].values())}",
+              f"ambiguous={sum(self.report['ambiguous_output_conflict'].values())}",
               file=sys.stderr, flush=True)
 
         # Step 4: rebuild provides index from ALL staged info (repaired +
@@ -801,7 +859,7 @@ class CatalogRebuild:
                              "unresolved regressions instead of simply "
                              "'not reached yet')")
 
-        ambiguous_count = sum(self.report["ambiguous"].values())
+        ambiguous_count = sum(self.report["ambiguous_output_conflict"].values())
         if ambiguous_count:
             blockers.append(f"{ambiguous_count} canonical package(s) have "
                              f"ambiguous provenance -- must be resolved "
@@ -899,6 +957,11 @@ class CatalogRebuild:
         excluded = self._load_excluded()
         classes = {"literal": 0, "virtual": 0, "excluded": 0, "unresolved": 0}
         unresolved_examples = []
+        # Full, uncapped list of every unresolved (package, OR-group) pair
+        # -- unresolved_examples above is capped at 200 for a readable
+        # report, but classify_unresolved_dependencies() needs the whole
+        # set to root-cause every one of them, not just a sample.
+        self.unresolved_deps_full = []
         for name, text in self.staged_info.items():
             for group in parse_info_depends(text):
                 if any(a in canonical_names for a in group):
@@ -911,6 +974,7 @@ class CatalogRebuild:
                     classes["excluded"] += 1
                     continue
                 classes["unresolved"] += 1
+                self.unresolved_deps_full.append((name, group))
                 if len(unresolved_examples) < 200:
                     unresolved_examples.append(f"{name}: {'|'.join(group)}")
         classes["unresolved_examples"] = unresolved_examples
@@ -1313,6 +1377,155 @@ def classify_orphans(arch, out_path):
     return result
 
 
+# Heuristic patterns for "this dependency looks like packaging/build
+# tooling that was never meant to be an installable runtime dependency."
+# This is a CANDIDATE classification only -- it does not read or write
+# state/excluded-deps.txt and never excludes anything by itself; a human
+# still has to review and add entries there. Kept narrow and pattern-
+# based (not a growing name list) so it stays auditable.
+_EXCLUDED_DEP_HEURISTIC_RES = [
+    re.compile(p) for p in [
+        r"^dpkg(-dev)?$", r"^debhelper$", r"^cdbs$", r"^dh-",
+        r"^libdpkg-perl$", r"^devscripts$", r"^build-essential$",
+        r"^apt(-utils)?$", r"^dpkg-dev$",
+        r"^gir1-2-",                       # GObject introspection -dev typelibs
+        r"^perlapi-",                      # Perl internal ABI virtual packages
+        r".*-i386-cross$",                 # cross-compilation toolchain packages
+        r"^rpm(-build)?$", r"^dnf$", r"^yum$",
+        r"^pkgconfig$", r"^pkg-config$",
+        r"^kernel-devel", r"^kmodtool$", r"^createrepo-c$",
+        r"^policycoreutils", r"^selinux-policy",
+        r"^systemd-devel",
+    ]
+]
+
+
+def _looks_intentionally_excluded(dep_name):
+    return any(p.match(dep_name) for p in _EXCLUDED_DEP_HEURISTIC_RES)
+
+
+def _fuzzy_key(name):
+    """Loosened comparison key: strip everything but lowercase alnum, so
+    naming-convention noise (dashes vs dots, RPM's soname parens/suffixes,
+    duplicate separators) doesn't hide an otherwise-real match. Used ONLY
+    to flag normalization_mismatch candidates for human review -- never to
+    silently accept a dependency as resolved."""
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def classify_unresolved_dependencies(arch, out_path):
+    """Root-causes EVERY unresolved dependency group (not a sample) into
+    exactly one of:
+      - intentionally_excluded_dependency: matches a known packaging/
+        build-tool-only naming pattern (see _EXCLUDED_DEP_HEURISTIC_RES).
+        A CANDIDATE for state/excluded-deps.txt, not an automatic
+        exclusion -- this function never writes that file.
+      - missing_literal_package: the exact sanitized name is a real
+        upstream package (any distro, any component) that simply isn't
+        part of our canonical/mirrored set yet.
+      - missing_virtual_provider_mapping: the exact sanitized name is
+        something SOME upstream package's Provides: declares, but no
+        canonical package currently carries that provides entry (either
+        the providing package isn't mirrored, or our provides extraction
+        missed a real entry for one that is).
+      - normalization_mismatch: neither of the above matched exactly, but
+        a punctuation/case-insensitive loosened match against every
+        upstream name/provides target DOES find a plausible candidate --
+        this is very likely a sanitize_name()/extraction bug, not a real
+        gap, and is reported with the matched candidate for verification.
+      - genuinely_absent_upstream_package: no candidate found anywhere,
+        by any of the above -- the dependency does not appear to exist
+        upstream at all (dead/renamed/virtual-implicit package).
+    Reuses a full (non-publishing) CatalogRebuild.run() to get the exact
+    same unresolved set the real gate would see, then cross-references
+    every unique unresolved name against ALL scanned upstream stanzas
+    (every distro, whether canonical/mirrored or not) -- not just the
+    canonical subset -- since a "missing" dependency's whole point is
+    that it may exist upstream without being part of our mirrored set."""
+    workdir = tempfile.mkdtemp()
+    rebuild = CatalogRebuild(arch, workdir, publish=False)
+    rebuild.run()
+
+    all_upstream_names = set()
+    all_upstream_provides = set()
+    for st in rebuild.stanzas:
+        all_upstream_names.add(st.sanitized_name)
+        if st.source_distro in ("ubuntu", "debian"):
+            groups = parse_dep_field(st.raw.get("Provides", ""))
+        elif st.source_distro == "fedora":
+            groups = rpm_entries_to_groups(st.raw["provides"])
+        else:
+            continue
+        all_upstream_provides.update(provides_names(groups))
+
+    fuzzy_names = {_fuzzy_key(n): n for n in all_upstream_names}
+    fuzzy_provides = {_fuzzy_key(n): n for n in all_upstream_provides}
+
+    # Classify per UNIQUE dependency name (many packages share the same
+    # missing dependency -- e.g. hundreds depend on "dpkg-dev") but keep
+    # every (package, group) occurrence for accurate counts and examples.
+    occurrences = {}  # dep_name -> list of "pkg: alt1|alt2" strings
+    for pkg_name, group in rebuild.unresolved_deps_full:
+        # A group is only unresolved as a WHOLE -- classify by its first
+        # alternative, which is representative for the overwhelming
+        # majority of unresolved groups (single-alternative in practice).
+        dep_name = group[0]
+        occurrences.setdefault(dep_name, []).append(f"{pkg_name}: {'|'.join(group)}")
+
+    buckets = {
+        "intentionally_excluded_dependency": {},
+        "missing_literal_package": {},
+        "missing_virtual_provider_mapping": {},
+        "normalization_mismatch": {},
+        "genuinely_absent_upstream_package": {},
+    }
+    for dep_name, examples in occurrences.items():
+        if _looks_intentionally_excluded(dep_name):
+            bucket = "intentionally_excluded_dependency"
+            extra = {}
+        elif dep_name in all_upstream_names:
+            bucket = "missing_literal_package"
+            extra = {}
+        elif dep_name in all_upstream_provides:
+            bucket = "missing_virtual_provider_mapping"
+            extra = {}
+        else:
+            fk = _fuzzy_key(dep_name)
+            candidate = fuzzy_names.get(fk) or fuzzy_provides.get(fk)
+            if candidate:
+                bucket = "normalization_mismatch"
+                extra = {"fuzzy_matched_candidate": candidate}
+            else:
+                bucket = "genuinely_absent_upstream_package"
+                extra = {}
+        buckets[bucket][dep_name] = {
+            "occurrence_count": len(examples),
+            "examples": sorted(examples)[:5],
+            **extra,
+        }
+
+    summary = {
+        bucket: {
+            "unique_dependency_names": len(entries),
+            "total_occurrences": sum(e["occurrence_count"] for e in entries.values()),
+        }
+        for bucket, entries in buckets.items()
+    }
+    out = {
+        "arch": arch,
+        "total_unresolved_occurrences": len(rebuild.unresolved_deps_full),
+        "total_unique_unresolved_names": len(occurrences),
+        "summary": summary,
+        "buckets": buckets,
+    }
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2, sort_keys=True)
+    print(f"[classify-deps] {arch}: {len(rebuild.unresolved_deps_full)} unresolved "
+          f"occurrence(s), {len(occurrences)} unique name(s) -- {summary}",
+          file=sys.stderr, flush=True)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", required=True, choices=["aarch64", "x86_64"])
@@ -1336,6 +1549,13 @@ def main():
                      help="Instead of a full run, list pkgs/<arch>/ and classify "
                           "orphan objects by which siblings exist, then exit. "
                           "Read-only -- never quarantines or deletes anything.")
+    ap.add_argument("--classify-unresolved-deps", action="store_true",
+                     help="Instead of a full run, root-cause every unresolved "
+                          "dependency group into missing_literal_package/"
+                          "missing_virtual_provider_mapping/normalization_"
+                          "mismatch/intentionally_excluded_dependency/"
+                          "genuinely_absent_upstream_package, then exit. "
+                          "Read-only -- never writes state/excluded-deps.txt.")
     args = ap.parse_args()
 
     if args.diagnose_ambiguous:
@@ -1354,6 +1574,12 @@ def main():
         os.makedirs(args.report_dir, exist_ok=True)
         out_path = os.path.join(args.report_dir, f"orphan-classification-{args.arch}.json")
         classify_orphans(args.arch, out_path)
+        return
+
+    if args.classify_unresolved_deps:
+        os.makedirs(args.report_dir, exist_ok=True)
+        out_path = os.path.join(args.report_dir, f"unresolved-deps-classification-{args.arch}.json")
+        classify_unresolved_dependencies(args.arch, out_path)
         return
 
     workdir = tempfile.mkdtemp()

@@ -51,19 +51,33 @@ class ProvenanceRecord:
     # payload. A future run with stronger evidence (e.g. this same package
     # resolving unambiguously once upstream versions diverge) should
     # upgrade a bootstrap record to verified, never the reverse.
+    # "equivalent_provenance_tie": the name+version match was genuinely
+    # ambiguous (2+ distinct upstream sources) AND bootstrap disambiguation
+    # against live content couldn't pick a winner either -- but every
+    # surviving candidate renders the EXACT SAME canonical semantic
+    # fingerprint and the EXACT SAME staged .info text (see
+    # candidates_are_output_equivalent). Which candidate is recorded as
+    # "the" source is arbitrary and doesn't matter -- the published output
+    # is provably candidate-invariant. This is NOT a claim that any one
+    # candidate is proven correct; it is a claim that proof is unnecessary
+    # because they all agree. `equivalent_candidates` records the full tied
+    # set so that fact stays visible, never silently collapsed into a
+    # single unproven source.
     CONFIDENCE_VERIFIED = "verified"
     CONFIDENCE_BOOTSTRAP = "bootstrap_semantic_match"
+    CONFIDENCE_EQUIVALENT_TIE = "equivalent_provenance_tie"
 
     __slots__ = (
         "name", "arch", "source_distro", "suite", "source_arch",
         "component", "upstream_name", "upstream_version", "wsh_filename",
         "payload_sha256", "upstream_filename", "confidence",
+        "equivalent_candidates",
     )
 
     def __init__(self, name, arch, source_distro, suite, source_arch,
                  component, upstream_name, upstream_version, wsh_filename,
                  payload_sha256=None, upstream_filename=None,
-                 confidence=CONFIDENCE_VERIFIED):
+                 confidence=CONFIDENCE_VERIFIED, equivalent_candidates=None):
         self.name = name
         self.arch = arch
         self.source_distro = source_distro
@@ -76,6 +90,11 @@ class ProvenanceRecord:
         self.payload_sha256 = payload_sha256
         self.upstream_filename = upstream_filename
         self.confidence = confidence
+        # Only populated for CONFIDENCE_EQUIVALENT_TIE records: a list of
+        # {source_distro, suite, source_arch, component, upstream_name,
+        # upstream_version} dicts for EVERY tied candidate, not just the
+        # one arbitrarily chosen to populate the fields above.
+        self.equivalent_candidates = equivalent_candidates
 
     def to_dict(self):
         return {k: getattr(self, k) for k in self.__slots__}
@@ -336,6 +355,35 @@ def fingerprints_semantically_equal(a, b):
         if va is None or vb is None:
             continue
         if va != vb:
+            return False
+    return True
+
+
+def candidates_are_output_equivalent(candidates, fingerprint_fn, render_fn):
+    """True when EVERY candidate in an ambiguous name+version collision
+    would produce byte-identical published output -- the exact same
+    canonical semantic fingerprint (see fingerprint_fn) AND the exact same
+    rendered .info text (see render_fn). Unlike fingerprints_semantically_
+    equal(), this is intentionally NOT lenient about None/missing fields:
+    a Fedora candidate's fingerprint has structurally-None fields (pre_
+    depends, breaks, replaces, essential, multi_arch) that a Debian/Ubuntu
+    candidate's never does, so a cross-family tie will correctly never
+    register here even if the fields that ARE comparable happen to agree
+    -- that's a real difference in what could be asserted about the
+    package, not a tie. Also compares the full rendered .info text (not
+    just the fingerprint fields), since the fingerprint deliberately
+    excludes free-text fields like description -- true output-invariance
+    requires the *published* text to be identical too, not just the
+    structural fields. When this holds, which candidate gets picked is
+    provably irrelevant to what ends up live."""
+    if len(candidates) < 2:
+        return True
+    first_fp = fingerprint_fn(candidates[0])
+    first_info = render_fn(candidates[0])
+    for c in candidates[1:]:
+        if fingerprint_fn(c) != first_fp:
+            return False
+        if render_fn(c) != first_info:
             return False
     return True
 

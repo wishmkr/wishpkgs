@@ -35,6 +35,7 @@ fast to run in CI on every push.
 """
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -118,10 +119,18 @@ class ProvenanceMatchingTests(unittest.TestCase):
         # is zero evidence either way, so this lands in "unresolved" (not
         # "ambiguous") under the evidence-based taxonomy -- either way it
         # must never be staged or published.
+        # Depends deliberately differ between the two candidates -- this
+        # must be a genuine output conflict, not a case the new
+        # equivalent-provenance-tie check would short-circuit past (see
+        # EquivalentProvenanceTieTests for that scenario).
         rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
         rc_stanzas = [
-            stanza("ubuntu", "noble", "arm64", "main", "foo", "1.0-1ubuntu1"),
-            stanza("debian", "bookworm", "arm64", "main", "foo", "1.0-1"),
+            stanza("ubuntu", "noble", "arm64", "main", "foo", "1.0-1ubuntu1",
+                   raw={"Package": "foo", "Version": "1.0-1ubuntu1", "Depends": "libfoo1",
+                        "Provides": "", "Conflicts": "", "Breaks": "", "Description": "x"}),
+            stanza("debian", "bookworm", "arm64", "main", "foo", "1.0-1",
+                   raw={"Package": "foo", "Version": "1.0-1", "Depends": "libbar1",
+                        "Provides": "", "Conflicts": "", "Breaks": "", "Description": "x"}),
         ]
         rc.scan_all_stanzas = lambda arch: rc_stanzas
         rc.load_canonical_versions = lambda arch, workdir: {"foo": "1.0"}
@@ -285,8 +294,16 @@ class StrictPublishGateTests(unittest.TestCase):
                        raw={"Package": "clean-pkg", "Version": "1.0", "Depends": "",
                             "Provides": "", "Conflicts": "", "Breaks": "",
                             "Description": "fine"})
-        ambiguous_a = stanza("ubuntu", "noble", "arm64", "main", "shared-name", "1.0-1ubuntu1")
-        ambiguous_b = stanza("debian", "bookworm", "arm64", "main", "shared-name", "1.0-1")
+        # Depends deliberately differ -- a genuine output conflict, not an
+        # equivalent-provenance-tie the new pre-check would wave through.
+        ambiguous_a = stanza("ubuntu", "noble", "arm64", "main", "shared-name", "1.0-1ubuntu1",
+                              raw={"Package": "shared-name", "Version": "1.0-1ubuntu1",
+                                   "Depends": "libfoo1", "Provides": "", "Conflicts": "",
+                                   "Breaks": "", "Description": "x"})
+        ambiguous_b = stanza("debian", "bookworm", "arm64", "main", "shared-name", "1.0-1",
+                              raw={"Package": "shared-name", "Version": "1.0-1",
+                                   "Depends": "libbar1", "Provides": "", "Conflicts": "",
+                                   "Breaks": "", "Description": "x"})
 
         rc.scan_all_stanzas = lambda arch: [good, ambiguous_a, ambiguous_b]
         rc.load_canonical_versions = lambda arch, workdir: {
@@ -542,7 +559,7 @@ class BootstrapSemanticMatchTests(unittest.TestCase):
 
         report = rebuild.run()
 
-        self.assertEqual(sum(report["ambiguous"].values()), 0)
+        self.assertEqual(sum(report["ambiguous_output_conflict"].values()), 0)
         self.assertEqual(sum(report["bootstrap_matched"].values()), 1)
         self.assertIn("shared-pkg", rebuild.staged_info)
         record = rebuild.new_manifest["shared-pkg"]
@@ -603,7 +620,7 @@ class BootstrapSemanticMatchTests(unittest.TestCase):
         report = rebuild.run()
 
         self.assertEqual(sum(report["bootstrap_matched"].values()), 0)
-        self.assertEqual(sum(report["ambiguous"].values()), 0)
+        self.assertEqual(sum(report["ambiguous_output_conflict"].values()), 0)
         self.assertEqual(sum(report["unresolved"].values()), 1)
         self.assertNotIn("shared-pkg", rebuild.staged_info)
 
@@ -622,7 +639,7 @@ class BootstrapSemanticMatchTests(unittest.TestCase):
         report = rebuild.run()
 
         self.assertEqual(sum(report["bootstrap_matched"].values()), 0)
-        self.assertEqual(sum(report["ambiguous"].values()), 1)
+        self.assertEqual(sum(report["ambiguous_output_conflict"].values()), 1)
 
     def test_excluded_package_never_bootstrap_matched_even_with_unique_match(self):
         u, d = self._ambiguous_pair(ubuntu_depends="libfoo1", debian_depends="libbar1")
@@ -734,6 +751,111 @@ class BootstrapSemanticMatchTests(unittest.TestCase):
         self.assertEqual(len(published_calls), 1)
 
 
+class EquivalentProvenanceTieTests(unittest.TestCase):
+    """A genuinely ambiguous name+version collision where every surviving
+    candidate would render byte-identical output (fingerprint AND .info
+    text) doesn't need proof of which source is correct -- the choice is
+    provably irrelevant to what gets published. These records are tagged
+    CONFIDENCE_EQUIVALENT_TIE, carry the full tied candidate set, and are
+    publish-safe (unlike ambiguous_output_conflict, which still blocks)."""
+
+    def _tied_pair(self, ubuntu_version="1.0-1ubuntu1", debian_version="1.0-1"):
+        # Depends empty deliberately -- isolates the equivalent-tie
+        # mechanism from the unrelated dependency-classification gate.
+        raw = lambda: {"Package": "shared-pkg", "Depends": "",
+                        "Provides": "", "Conflicts": "", "Breaks": "",
+                        "Description": "identical description"}
+        u = stanza("ubuntu", "noble", "arm64", "main", "shared-pkg", ubuntu_version,
+                   raw=dict(raw(), Version=ubuntu_version))
+        d = stanza("debian", "bookworm", "arm64", "main", "shared-pkg", debian_version,
+                   raw=dict(raw(), Version=debian_version))
+        return u, d
+
+    def test_identical_output_candidates_accepted_as_equivalent_tie(self):
+        u, d = self._tied_pair()
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: None  # no live info needed at all
+        rebuild._find_orphans = lambda names: []
+
+        report = rebuild.run()
+
+        self.assertEqual(sum(report["ambiguous_output_conflict"].values()), 0)
+        self.assertEqual(sum(report["equivalent_provenance_tie"].values()), 1)
+        self.assertIn("shared-pkg", rebuild.staged_info)
+        record = rebuild.new_manifest["shared-pkg"]
+        self.assertEqual(record.confidence, rc.ProvenanceRecord.CONFIDENCE_EQUIVALENT_TIE)
+        self.assertEqual(len(record.equivalent_candidates), 2)
+        self.assertEqual({c["source_distro"] for c in record.equivalent_candidates},
+                          {"ubuntu", "debian"})
+
+    def test_equivalent_tie_does_not_block_publish(self):
+        u, d = self._tied_pair()
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=True)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: None
+        rebuild._find_orphans = lambda names: []
+        published_calls = []
+        rebuild._publish = lambda orphans: published_calls.append(orphans)
+
+        report = rebuild.run()
+
+        self.assertEqual(report["publish_blockers"], [])
+        self.assertTrue(report["published"])
+        self.assertEqual(len(published_calls), 1)
+
+    def test_differing_description_is_not_a_tie_even_with_identical_fingerprint(self):
+        # Same Depends (so the semantic FINGERPRINT matches), but the
+        # published .info text also carries description -- which the
+        # fingerprint deliberately excludes but the full-render comparison
+        # doesn't. A real difference in what would be published, so this
+        # must NOT be treated as an equivalent tie.
+        u = stanza("ubuntu", "noble", "arm64", "main", "shared-pkg", "1.0-1ubuntu1",
+                   raw={"Package": "shared-pkg", "Version": "1.0-1ubuntu1",
+                        "Depends": "libfoo1", "Provides": "", "Conflicts": "",
+                        "Breaks": "", "Description": "alpha variant"})
+        d = stanza("debian", "bookworm", "arm64", "main", "shared-pkg", "1.0-1",
+                   raw={"Package": "shared-pkg", "Version": "1.0-1",
+                        "Depends": "libfoo1", "Provides": "", "Conflicts": "",
+                        "Breaks": "", "Description": "beta variant"})
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: None
+        rebuild._find_orphans = lambda names: []
+
+        report = rebuild.run()
+
+        self.assertEqual(sum(report["equivalent_provenance_tie"].values()), 0)
+        self.assertNotIn("shared-pkg", rebuild.staged_info)
+
+    def test_equivalent_tie_still_verifies_continuity_against_prior_manifest(self):
+        u, d = self._tied_pair()
+        prior_record = rc.ProvenanceRecord(
+            name="shared-pkg", arch="aarch64", source_distro="fedora", suite="40",
+            source_arch="x86_64", component="Everything", upstream_name="shared-pkg",
+            upstream_version="2.0", wsh_filename="shared-pkg-1.0-1-aarch64.wsh",
+            payload_sha256="a" * 64,
+        )
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=False)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: None
+        rebuild._find_orphans = lambda names: []
+        orig_load = rc.load_provenance_manifest
+        rc.load_provenance_manifest = lambda arch, workdir: {"shared-pkg": prior_record}
+        try:
+            report = rebuild.run()
+        finally:
+            rc.load_provenance_manifest = orig_load
+
+        self.assertEqual(sum(report["equivalent_provenance_tie"].values()), 0)
+        self.assertEqual(sum(report["unresolved"].values()), 1)
+        self.assertNotIn("shared-pkg", rebuild.staged_info)
+
+
 class SnapshotAndOrphanHandlingTests(unittest.TestCase):
     """A real publish must snapshot the complete live state (rollback
     point) before touching anything staged or live, and must respect
@@ -838,6 +960,62 @@ class SnapshotAndOrphanHandlingTests(unittest.TestCase):
         # The snapshot itself still uses sh() (for the s3 sync/cp calls) --
         # keep_orphans must only suppress the quarantine move, nothing else.
         self.assertTrue(any(report["snapshot_prefix"] in c for c in calls))
+
+
+class UnresolvedDependencyClassificationTests(unittest.TestCase):
+    """classify_unresolved_dependencies() must root-cause every unresolved
+    dependency into exactly one of five buckets -- this exercises one
+    representative case per bucket in a single synthetic catalog."""
+
+    def test_every_bucket_classified_correctly(self):
+        mypkg = stanza(
+            "ubuntu", "noble", "arm64", "main", "mypkg", "1.0",
+            raw={"Package": "mypkg", "Version": "1.0",
+                 "Depends": "dpkg-dev, some-real-pkg, some-virtual-thing, "
+                            "libfoo-so-164bit, totally-nonexistent-dep",
+                 "Provides": "", "Conflicts": "", "Breaks": "",
+                 "Description": "x"})
+        # Exists upstream by name, but not canonical -- missing_literal_package.
+        real_pkg = stanza(
+            "ubuntu", "noble", "arm64", "main", "some-real-pkg", "2.0",
+            raw={"Package": "some-real-pkg", "Version": "2.0", "Depends": "",
+                 "Provides": "", "Conflicts": "", "Breaks": "", "Description": "x"})
+        # Provides a virtual name matching one of mypkg's deps, but isn't
+        # canonical itself -- missing_virtual_provider_mapping.
+        virtual_provider = stanza(
+            "ubuntu", "noble", "arm64", "main", "virtual-provider-pkg", "1.0",
+            raw={"Package": "virtual-provider-pkg", "Version": "1.0", "Depends": "",
+                 "Provides": "some-virtual-thing", "Conflicts": "", "Breaks": "",
+                 "Description": "x"})
+        # Its own sanitized name is punctuation-different from the dep
+        # string but fuzzy-identical -- normalization_mismatch.
+        soname_owner = stanza(
+            "ubuntu", "noble", "arm64", "main", "libfoo.so.1-64bit", "1.0",
+            raw={"Package": "libfoo.so.1-64bit", "Version": "1.0", "Depends": "",
+                 "Provides": "", "Conflicts": "", "Breaks": "", "Description": "x"})
+
+        rc.scan_all_stanzas = lambda arch: [mypkg, real_pkg, virtual_provider, soname_owner]
+        rc.load_canonical_versions = lambda arch, workdir: {"mypkg": "1.0"}
+        rc.CatalogRebuild._fetch_current_info = lambda self, name: None
+        rc.CatalogRebuild._find_orphans = lambda self, names: []
+
+        out_path = os.path.join(tempfile.mkdtemp(), "out.json")
+        try:
+            result = rc.classify_unresolved_dependencies("aarch64", out_path)
+        finally:
+            del rc.CatalogRebuild._fetch_current_info
+            del rc.CatalogRebuild._find_orphans
+
+        buckets = result["buckets"]
+        self.assertIn("dpkg-dev", buckets["intentionally_excluded_dependency"])
+        self.assertIn("some-real-pkg", buckets["missing_literal_package"])
+        self.assertIn("some-virtual-thing", buckets["missing_virtual_provider_mapping"])
+        self.assertIn("libfoo-so-164bit", buckets["normalization_mismatch"])
+        self.assertEqual(
+            buckets["normalization_mismatch"]["libfoo-so-164bit"]["fuzzy_matched_candidate"],
+            "libfoo-so-1-64bit")
+        self.assertIn("totally-nonexistent-dep", buckets["genuinely_absent_upstream_package"])
+        self.assertEqual(result["total_unique_unresolved_names"], 5)
 
 
 if __name__ == "__main__":
