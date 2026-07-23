@@ -9,19 +9,31 @@ name: Rebuild catalog (provenance-aware full repair)
 # REBUILD_DEADLINE_SECONDS, well under the runner's hard timeout, the same
 # pattern the mirror scripts already use.
 #
-# Defaults to --dry-run (publish input is false): reads live upstream +
-# B2 state and writes a repair-report-<arch>.json artifact, touches
-# nothing. Safe to run repeatedly against production for inspection.
-# publish: true attempts the real thing, but the strict gate in
-# rebuild_catalog.py refuses to publish anything unless EVERY canonical
-# package resolved cleanly and every dependency classified -- expect it to
-# refuse on a catalog with genuine upstream gaps (there will be some, at
-# ~16k+ packages) until those are dealt with. That refusal is by design.
+# Defaults to a dry run (publish_arch: none): reads live upstream + B2
+# state and writes a repair-report-<arch>.json artifact, touches nothing.
+# Safe to run repeatedly against production for inspection. publish_arch
+# set to x86_64 or aarch64 attempts the real thing for THAT arch only --
+# publishing both architectures in a single trigger is deliberately not
+# offered, so a canary (x86_64 first) can be validated before aarch64
+# follows. Either way, the strict gate in rebuild_catalog.py refuses to
+# publish anything unless EVERY canonical package resolved cleanly with
+# proven, continuity-verified provenance, every provides target exists,
+# and every dependency classified -- expect it to refuse on a catalog
+# with genuine upstream gaps until those are dealt with. That refusal is
+# by design.
 on:
   workflow_dispatch:
     inputs:
-      publish:
-        description: "Attempt to publish (strict gate still applies; false = report-only)"
+      publish_arch:
+        description: "Which arch to attempt publishing this run (strict gate still applies). Publishing both in one trigger is deliberately not offered -- run x86_64 as a canary first, then aarch64 separately."
+        type: choice
+        options:
+          - none
+          - x86_64
+          - aarch64
+        default: none
+      keep_orphans:
+        description: "Skip quarantining orphan objects even when publishing (leaves old objects untouched for rollback safety)"
         type: boolean
         default: false
       diagnose_ambiguous:
@@ -79,8 +91,11 @@ jobs:
             ARGS="$ARGS --evaluate-bootstrap ${{ inputs.evaluate_bootstrap }}"
           elif [ "${{ inputs.classify_orphans }}" = "true" ]; then
             ARGS="$ARGS --classify-orphans"
-          elif [ "${{ inputs.publish }}" = "true" ]; then
+          elif [ "${{ inputs.publish_arch }}" = "${{ matrix.arch }}" ]; then
             ARGS="$ARGS --publish"
+          fi
+          if [ "${{ inputs.keep_orphans }}" = "true" ]; then
+            ARGS="$ARGS --keep-orphans"
           fi
           python3 rebuild_catalog.py $ARGS
       - uses: actions/upload-artifact@v4

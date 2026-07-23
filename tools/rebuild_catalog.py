@@ -500,14 +500,27 @@ def stanza_to_record(name, arch, stanza, wsh_filename, payload_sha256,
 # ---------------------------------------------------------------------
 
 class CatalogRebuild:
-    def __init__(self, arch, workdir, publish=False):
+    def __init__(self, arch, workdir, publish=False, keep_orphans=False):
         self.arch = arch
         self.workdir = workdir
         self.publish = publish
+        # keep_orphans=True skips the quarantine-move step in _publish() --
+        # used for a canary/rollout publish where old objects must stay
+        # exactly as they are until the canary is proven clean, per the
+        # explicit "do not delete or quarantine old objects yet" directive.
+        self.keep_orphans = keep_orphans
         self.report = {
             "arch": arch,
             "repaired": {}, "unchanged": {}, "ambiguous": {},
-            "orphaned": {}, "unresolved": {}, "rejected": {},
+            "orphaned": {}, "unresolved": {},
+            # "rejected": a unique bootstrap fingerprint match that hit a
+            # concrete contradiction (exclusion list, self-inconsistent
+            # filename) -- distinct from "ambiguous" (genuine multi-match
+            # ties) and from "invalid_provides" (a different rejection:
+            # a provides target that isn't a canonical package at all).
+            "rejected": {},
+            "invalid_provides": {},
+            "continuity_mismatches": {},
             "bootstrap_matched": {},
         }
         self.staged_info = {}     # name -> new .info text
@@ -610,10 +623,17 @@ class CatalogRebuild:
                 if bootstrap_result.status == BootstrapMatchResult.UNRESOLVED:
                     self._bump("unresolved", "bootstrap-no-match")
                     continue
-                if bootstrap_result.status in (BootstrapMatchResult.AMBIGUOUS,
-                                                BootstrapMatchResult.REJECTED):
+                if bootstrap_result.status == BootstrapMatchResult.AMBIGUOUS:
                     distros = ",".join(sorted({c.source_distro for c in result.candidates}))
                     self._bump("ambiguous", distros)
+                    continue
+                if bootstrap_result.status == BootstrapMatchResult.REJECTED:
+                    # A concrete contradiction, not a mere tie -- tracked
+                    # separately from "ambiguous" so the repair report (and
+                    # the publish gate below) can name the actual reason.
+                    rejected_distro = (bootstrap_result.stanza.source_distro
+                                        if bootstrap_result.stanza else "unknown")
+                    self._bump("rejected", rejected_distro)
                     continue
 
                 # ACCEPTED by fingerprint -- still subject to the same
@@ -627,6 +647,7 @@ class CatalogRebuild:
                 prior_record = self.prior_manifest.get(name)
                 if not verify_continuity(bootstrap_stanza, prior_record, live_sha256):
                     self._bump("unresolved", "bootstrap-continuity-mismatch")
+                    self._bump("continuity_mismatches", "bootstrap")
                     continue
 
                 # Bootstrap-accepted: content already matches live, so this
@@ -651,6 +672,7 @@ class CatalogRebuild:
             prior_record = self.prior_manifest.get(name)
             if not verify_continuity(stanza, prior_record, live_sha256):
                 self._bump("unresolved", "continuity-mismatch")
+                self._bump("continuity_mismatches", "resolved")
                 continue
 
             new_info = render_info_from_stanza(stanza)
@@ -699,7 +721,7 @@ class CatalogRebuild:
         bad_provides = {v: r for v, r in self.provides_index.items()
                          if not (r & canonical_names)}
         for virtual, reals in bad_provides.items():
-            self._bump("rejected", "provides:" + virtual)
+            self._bump("invalid_provides", virtual)
             del self.provides_index[virtual]
 
         # Step 9: classify every literal dependency across all staged info.
@@ -790,6 +812,25 @@ class CatalogRebuild:
                              f"no proven provenance (or failed continuity "
                              f"verification) -- must be resolved before "
                              f"publish, not skipped")
+        rejected_count = sum(self.report["rejected"].values())
+        if rejected_count:
+            blockers.append(f"{rejected_count} canonical package(s) had a "
+                             f"unique bootstrap fingerprint match rejected "
+                             f"for a concrete contradiction (exclusion list "
+                             f"or self-inconsistent upstream filename) -- "
+                             f"must be resolved before publish, not skipped")
+        invalid_provides_count = sum(self.report["invalid_provides"].values())
+        if invalid_provides_count:
+            blockers.append(f"{invalid_provides_count} provides target(s) "
+                             f"do not resolve to any canonical package -- "
+                             f"every provider target must exist before "
+                             f"publish")
+        continuity_count = sum(self.report["continuity_mismatches"].values())
+        if continuity_count:
+            blockers.append(f"{continuity_count} package(s) failed "
+                             f"continuity verification against the prior "
+                             f"trusted provenance manifest -- a name+version "
+                             f"match alone is not enough")
         dep_unresolved = dep_report.get("unresolved", 0)
         if dep_unresolved:
             blockers.append(f"{dep_unresolved} dependency group(s) are not "
@@ -928,6 +969,40 @@ class CatalogRebuild:
                 orphans.append(prefix + fname)
         return orphans
 
+    def _snapshot_live_state(self):
+        """Copies the complete current live state for this arch -- every
+        .info under pkgs/<arch>/, the canonical index, the provides index,
+        and the provenance manifest -- to a timestamped snapshot/<arch>/
+        <generation>/ prefix, BEFORE anything staged is uploaded or any
+        live key is touched. This is the rollback point: the previous live
+        generation stays fully intact and fetchable even after publish,
+        since publish only ever overwrites pkgs/<arch>/*.info and the two
+        index/manifest objects in place, never deletes anything. Uses
+        server-side S3 copy (source and dest are both s3:// URIs) so this
+        never round-trips the ~16k .info objects through local disk."""
+        generation = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        snapshot_prefix = f"snapshot/{self.arch}/{generation}/"
+        print(f"[publish] snapshotting live state for {self.arch} to "
+              f"{snapshot_prefix} before touching anything...",
+              file=sys.stderr, flush=True)
+        sh(f'aws s3 sync "s3://{B2_BUCKET}/pkgs/{self.arch}/" '
+           f'"s3://{B2_BUCKET}/{snapshot_prefix}pkgs/{self.arch}/" '
+           f'--exclude "*" --include "*.info" '
+           f'--endpoint-url {B2_ENDPOINT} --no-progress')
+        sh(f'aws s3 cp "s3://{B2_BUCKET}/index/{self.arch}.txt" '
+           f'"s3://{B2_BUCKET}/{snapshot_prefix}index/{self.arch}.txt" '
+           f'--endpoint-url {B2_ENDPOINT} --no-progress')
+        sh(f'aws s3 cp "s3://{B2_BUCKET}/index/{self.arch}-provides.txt" '
+           f'"s3://{B2_BUCKET}/{snapshot_prefix}index/{self.arch}-provides.txt" '
+           f'--endpoint-url {B2_ENDPOINT} --no-progress')
+        sh(f'aws s3 cp "s3://{B2_BUCKET}/state/provenance/{self.arch}.json" '
+           f'"s3://{B2_BUCKET}/{snapshot_prefix}state/provenance/{self.arch}.json" '
+           f'--endpoint-url {B2_ENDPOINT} --no-progress')
+        print(f"[publish] snapshot complete: {snapshot_prefix}",
+              file=sys.stderr, flush=True)
+        self.report["snapshot_prefix"] = snapshot_prefix
+        return snapshot_prefix
+
     def _publish(self, orphans):
         # Only ever called after run() has fully computed the report AND
         # the strict gate in _publish_blockers found nothing to block on
@@ -950,6 +1025,8 @@ class CatalogRebuild:
         # content" -- it can never leave a live object partially written,
         # and it never touches live content while the staged catalog is
         # still incomplete or unverified.
+        self._snapshot_live_state()
+
         staging_prefix = f"staging/{self.arch}/pkgs/"
         staged_keys = []
         for name, text in self.staged_info.items():
@@ -1004,10 +1081,15 @@ class CatalogRebuild:
                        f, indent=2, sort_keys=True)
         b2_cp(manifest_tmp, f"state/provenance/{self.arch}.json")
 
-        for key in orphans:
-            dest = "quarantine/" + key[len("pkgs/"):] if key.startswith("pkgs/") else "quarantine/" + key
-            sh(f'aws s3 mv "s3://{B2_BUCKET}/{key}" "s3://{B2_BUCKET}/{dest}" '
-               f'--endpoint-url {B2_ENDPOINT}')
+        if self.keep_orphans:
+            print(f"[publish] keep_orphans set -- leaving {len(orphans)} "
+                  f"orphan object(s) exactly as they are, not quarantining "
+                  f"this run", file=sys.stderr, flush=True)
+        else:
+            for key in orphans:
+                dest = "quarantine/" + key[len("pkgs/"):] if key.startswith("pkgs/") else "quarantine/" + key
+                sh(f'aws s3 mv "s3://{B2_BUCKET}/{key}" "s3://{B2_BUCKET}/{dest}" '
+                   f'--endpoint-url {B2_ENDPOINT}')
 
 
 def diagnose_ambiguous(arch, sample_size, out_path):
@@ -1235,6 +1317,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--arch", required=True, choices=["aarch64", "x86_64"])
     ap.add_argument("--publish", action="store_true")
+    ap.add_argument("--keep-orphans", action="store_true",
+                     help="Skip quarantining orphan objects this run, even "
+                          "if publishing -- for a canary/rollout publish "
+                          "where old objects must be left exactly as they "
+                          "are until the canary is proven clean.")
     ap.add_argument("--report-dir", default=".")
     ap.add_argument("--diagnose-ambiguous", type=int, metavar="N", default=0,
                      help="Instead of a full run, sample N ambiguous packages "
@@ -1270,7 +1357,8 @@ def main():
         return
 
     workdir = tempfile.mkdtemp()
-    rebuild = CatalogRebuild(args.arch, workdir, publish=args.publish)
+    rebuild = CatalogRebuild(args.arch, workdir, publish=args.publish,
+                              keep_orphans=args.keep_orphans)
     report = rebuild.run()
 
     os.makedirs(args.report_dir, exist_ok=True)

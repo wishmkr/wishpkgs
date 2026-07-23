@@ -350,6 +350,54 @@ class StrictPublishGateTests(unittest.TestCase):
         self.assertTrue(report["published"])
         self.assertEqual(len(published_calls), 1)
 
+    def test_invalid_provides_bucket_blocks_publish_gate(self):
+        # Verifies the gate wiring directly: whenever invalid_provides is
+        # non-empty, _publish_blockers() must refuse. (Under today's
+        # provides_index construction -- step 4 only ever adds a CANONICAL
+        # package's own name as a provider -- bad_provides can never
+        # actually be non-empty in a real run, since every entry is by
+        # construction a subset of canonical_names. This test exercises
+        # the gate itself, defensively, independent of whether the current
+        # data flow can trigger it; a future refactor of how provides_index
+        # gets built must not silently lose this check.)
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=True)
+        rebuild.report["invalid_provides"]["some-orphaned-virtual"] = 1
+        blockers = rebuild._publish_blockers(
+            {"pkg"}, [stanza("ubuntu", "noble", "arm64", "main", "pkg", "1.0")],
+            {"literal": 0, "virtual": 0, "excluded": 0, "unresolved": 0})
+        self.assertTrue(any("provider target" in b for b in blockers))
+
+    def test_rejected_bootstrap_match_blocks_publish(self):
+        # A unique semantic-fingerprint match that hits a concrete
+        # contradiction (here: the bootstrap-exclusion list) must block
+        # the whole publish, not just quietly stay off to the side --
+        # "rejected" is tracked separately from "ambiguous" now, so it
+        # needs its own explicit gate check.
+        u = stanza("ubuntu", "noble", "arm64", "main", "shared-pkg", "1.0-1ubuntu1",
+                   raw={"Package": "shared-pkg", "Version": "1.0-1ubuntu1",
+                        "Depends": "libfoo1", "Provides": "", "Conflicts": "",
+                        "Breaks": "", "Description": "a"})
+        d = stanza("debian", "bookworm", "arm64", "main", "shared-pkg", "1.0-1",
+                   raw={"Package": "shared-pkg", "Version": "1.0-1",
+                        "Depends": "libbar1", "Provides": "", "Conflicts": "",
+                        "Breaks": "", "Description": "b"})
+        live_info = "description=x\nlicense=x\ndepends=libfoo1\n"  # matches only u
+
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=True)
+        rc.scan_all_stanzas = lambda arch: [u, d]
+        rc.load_canonical_versions = lambda arch, workdir: {"shared-pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: live_info
+        rebuild._find_orphans = lambda names: []
+        rebuild._load_bootstrap_exclusions = lambda: {"shared-pkg"}
+        published_calls = []
+        rebuild._publish = lambda orphans: published_calls.append(orphans)
+
+        report = rebuild.run()
+        self.assertFalse(report["published"])
+        self.assertEqual(published_calls, [])
+        self.assertEqual(sum(report["rejected"].values()), 1)
+        self.assertTrue(any("concrete contradiction" in b for b in report["publish_blockers"]))
+
 
 class ContinuityVerificationTests(unittest.TestCase):
     """Item 11: matching a name+version pair to an upstream stanza is not
@@ -590,7 +638,7 @@ class BootstrapSemanticMatchTests(unittest.TestCase):
         report = rebuild.run()
 
         self.assertEqual(sum(report["bootstrap_matched"].values()), 0)
-        self.assertEqual(sum(report["ambiguous"].values()), 1)
+        self.assertEqual(sum(report["rejected"].values()), 1)
 
     def test_unique_match_from_non_earliest_distro_is_still_accepted(self):
         # The removed distro-order heuristic used to reject a unique,
@@ -684,6 +732,112 @@ class BootstrapSemanticMatchTests(unittest.TestCase):
         self.assertEqual(report["publish_blockers"], [])
         self.assertTrue(report["published"])
         self.assertEqual(len(published_calls), 1)
+
+
+class SnapshotAndOrphanHandlingTests(unittest.TestCase):
+    """A real publish must snapshot the complete live state (rollback
+    point) before touching anything staged or live, and must respect
+    keep_orphans so a canary/rollout publish never quarantines old
+    objects until explicitly told to."""
+
+    def _clean_single_package_rebuild(self, **kwargs):
+        rebuild = rc.CatalogRebuild("aarch64", "/tmp", publish=True, **kwargs)
+        s = stanza("ubuntu", "noble", "arm64", "main", "pkg", "1.0",
+                   raw={"Package": "pkg", "Version": "1.0", "Depends": "",
+                        "Provides": "", "Conflicts": "", "Breaks": "",
+                        "Description": "x"})
+        rc.scan_all_stanzas = lambda arch: [s]
+        rc.load_canonical_versions = lambda arch, workdir: {"pkg": "1.0"}
+        rebuild._fetch_current_info = lambda name: None
+        return rebuild
+
+    def _install_fake_b2_store(self):
+        """A real _publish() round-trip-verifies every staged object by
+        writing it, then reading it back via b2_get -- the module-level
+        stub (b2_get always returns False) exists to guarantee no test can
+        ever hit the network, but it also makes that verification fail.
+        This fake in-memory store keeps that guarantee while letting
+        writes round-trip, so _publish() can run for real."""
+        store = {}
+
+        def fake_cp(local, key):
+            with open(local) as f:
+                store[key] = f.read()
+
+        def fake_get(key, local):
+            if key not in store:
+                return False
+            with open(local, "w") as f:
+                f.write(store[key])
+            return True
+
+        return fake_cp, fake_get
+
+    def test_snapshot_taken_before_any_staging_upload(self):
+        calls = []
+        fake_cp, fake_get = self._install_fake_b2_store()
+        orig_sh, orig_b2_cp, orig_b2_get = rc.sh, rc.b2_cp, rc.b2_get
+        rc.sh = lambda cmd: calls.append(("sh", cmd))
+
+        def recording_cp(local, key):
+            calls.append(("b2_cp", key))
+            fake_cp(local, key)
+        rc.b2_cp = recording_cp
+        rc.b2_get = fake_get
+        try:
+            rebuild = self._clean_single_package_rebuild()
+            rebuild._find_orphans = lambda names: []
+            report = rebuild.run()
+        finally:
+            rc.sh, rc.b2_cp, rc.b2_get = orig_sh, orig_b2_cp, orig_b2_get
+
+        self.assertTrue(report["published"])
+        self.assertTrue(report["snapshot_prefix"].startswith("snapshot/aarch64/"))
+
+        snapshot_indices = [i for i, c in enumerate(calls)
+                             if c[0] == "sh" and report["snapshot_prefix"] in c[1]]
+        staging_indices = [i for i, c in enumerate(calls)
+                            if c[0] == "b2_cp" and c[1].startswith("staging/")]
+        # index.txt, provides.txt, provenance manifest, and the pkgs/ sync
+        # all get copied into the snapshot prefix.
+        self.assertEqual(len(snapshot_indices), 4)
+        self.assertTrue(staging_indices)
+        self.assertLess(max(snapshot_indices), min(staging_indices))
+
+    def test_quarantine_moves_orphans_by_default(self):
+        calls = []
+        fake_cp, fake_get = self._install_fake_b2_store()
+        orig_sh, orig_b2_cp, orig_b2_get = rc.sh, rc.b2_cp, rc.b2_get
+        rc.sh = lambda cmd: calls.append(cmd)
+        rc.b2_cp, rc.b2_get = fake_cp, fake_get
+        try:
+            rebuild = self._clean_single_package_rebuild()
+            rebuild._find_orphans = lambda names: ["pkgs/aarch64/orphan-pkg.info"]
+            report = rebuild.run()
+        finally:
+            rc.sh, rc.b2_cp, rc.b2_get = orig_sh, orig_b2_cp, orig_b2_get
+
+        self.assertTrue(report["published"])
+        self.assertTrue(any("aws s3 mv" in c and "quarantine/" in c for c in calls))
+
+    def test_keep_orphans_skips_quarantine_move(self):
+        calls = []
+        fake_cp, fake_get = self._install_fake_b2_store()
+        orig_sh, orig_b2_cp, orig_b2_get = rc.sh, rc.b2_cp, rc.b2_get
+        rc.sh = lambda cmd: calls.append(cmd)
+        rc.b2_cp, rc.b2_get = fake_cp, fake_get
+        try:
+            rebuild = self._clean_single_package_rebuild(keep_orphans=True)
+            rebuild._find_orphans = lambda names: ["pkgs/aarch64/orphan-pkg.info"]
+            report = rebuild.run()
+        finally:
+            rc.sh, rc.b2_cp, rc.b2_get = orig_sh, orig_b2_cp, orig_b2_get
+
+        self.assertTrue(report["published"])
+        self.assertFalse(any("aws s3 mv" in c for c in calls))
+        # The snapshot itself still uses sh() (for the s3 sync/cp calls) --
+        # keep_orphans must only suppress the quarantine move, nothing else.
+        self.assertTrue(any(report["snapshot_prefix"] in c for c in calls))
 
 
 if __name__ == "__main__":
